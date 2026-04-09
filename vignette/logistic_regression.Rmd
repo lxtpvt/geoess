@@ -1,0 +1,671 @@
+---
+title: "Logistic regression with Gaussian prior"
+output: html_vignette
+vignette: >
+  %\VignetteIndexEntry{Logistic regression with Gaussian prior}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", message = FALSE, warning = FALSE)
+set.seed(20260218)
+
+library(geoess)
+library(rstan)
+
+rstan::rstan_options(auto_write = FALSE)
+options(mc.cores = 2)
+```
+
+## Motivation
+
+Logistic regression with Gaussian prior is a canonical non-conjugate setting,
+so the effective sample size (ESS) is not available from closed-form posterior
+updating. This vignette shows how to compute geometric ESS using `geoess` by
+combining analytic prior curvature with numerically evaluated per-observation
+Fisher information.
+
+## Model and Priors
+
+We consider logistic regression with two Gaussian joint priors for
+\(\beta = (\beta_0, \beta_1)\): an independent prior
+\(\beta \sim \mathcal{N}(0, \tau^2 I_d)\) and a correlated prior
+\(\beta \sim \mathcal{N}(0, \Sigma_\rho)\), where
+\[
+\Sigma_\rho = \tau^2
+\begin{pmatrix}
+1 & \rho \\
+\rho & 1
+\end{pmatrix}.
+\]
+Throughout the main analysis we use \(\tau = 1\) and, for the correlated
+scenario, \(\rho = 0.6\).
+
+The sampling model is
+
+\[
+y_i \mid x_i,\beta \sim \text{Bernoulli}\!\left(\operatorname{logit}^{-1}(x_i^\top\beta)\right),
+\qquad i=1,\dots,n,
+\]
+\[
+I_\pi(\beta) = -\nabla^2 \log \pi(\beta).
+\]
+
+For the independent Gaussian prior,
+\[
+I_\pi(\beta) = \tau^{-2} I_d,
+\]
+and for the correlated prior,
+\[
+I_{\pi,\rho}(\beta) = \Sigma_\rho^{-1}.
+\]
+
+For logistic regression, the per-observation Fisher information at a reference
+point \(\beta^*\) is estimated by
+\[
+I_1(\beta^*) \approx \frac{1}{n}\sum_{i=1}^n w_i x_i x_i^\top,
+\qquad w_i = p_i(1-p_i),\quad p_i = \operatorname{logit}^{-1}(x_i^\top\beta^*).
+\]
+
+Local ESS (trace form) is
+\[
+\mathrm{ESS}_{\text{local}}(\beta^*) = \frac{1}{d}\operatorname{tr}\!\left(I_1(\beta^*)^{-1}I_\pi\right).
+\]
+
+## Data Generating Setup
+
+```{r data-generating-setup}
+set.seed(20260218)
+
+n <- 200
+# d = 2 by default: intercept + one centered standardized covariate.
+# The centering ensures that at the symmetry reference beta = (0, 0), the
+# per-observation Fisher information is axis-aligned, so an independent prior
+# yields coordinate eigenvectors while a correlated prior rotates them.
+d <- 2
+beta_true <- c(-0.5, 1.0)
+tau <- 1
+
+x_raw <- rnorm(n)
+x_std <- as.numeric(scale(x_raw))
+X <- cbind(`(Intercept)` = 1, x = x_std)
+
+eta_true <- as.vector(X %*% beta_true)
+p_true <- plogis(eta_true)
+y <- rbinom(n, size = 1, prob = p_true)
+
+# Reusable helpers for this vignette
+fisher_logistic_per_obs <- function(beta, X) {
+  eta <- as.vector(X %*% beta)
+  p <- plogis(eta)
+  w <- p * (1 - p)
+  Xw <- sweep(X, 1, w, "*")
+  I1 <- crossprod(X, Xw) / nrow(X)
+  0.5 * (I1 + t(I1))
+}
+
+prior_covariance_gaussian <- function(d, tau, rho = 0) {
+  if (d == 2) {
+    return(tau^2 * matrix(c(1, rho, rho, 1), nrow = 2, byrow = TRUE))
+  }
+  if (abs(rho) > sqrt(.Machine$double.eps)) {
+    stop("Correlated Gaussian prior is currently implemented only for d = 2.")
+  }
+  diag(tau^2, d)
+}
+
+prior_curvature_gaussian <- function(d, tau, rho = 0) {
+  solve(prior_covariance_gaussian(d = d, tau = tau, rho = rho))
+}
+
+draw_prior_beta <- function(n_draws, d, tau = NULL, rho = 0, Sigma_prior = NULL) {
+  if (is.null(Sigma_prior)) {
+    if (is.null(tau)) stop("Provide either tau or Sigma_prior.")
+    Sigma_prior <- prior_covariance_gaussian(d = d, tau = tau, rho = rho)
+  }
+  R <- chol(Sigma_prior)
+  out <- matrix(rnorm(n_draws * d), ncol = d) %*% R
+  colnames(out) <- colnames(X)
+  out
+}
+
+data.frame(
+  n = n,
+  d = d,
+  beta_true_intercept = beta_true[1],
+  beta_true_slope = beta_true[2],
+  event_rate = mean(y)
+)
+```
+
+This simulation uses \(n=200\) observations with \(d=2\) predictors: an
+intercept with coefficient \(\beta_0\) and one standardized covariate with
+coefficient \(\beta_1\). The true coefficient vector is
+\(\beta_{\mathrm{true}} = (-0.5, 1.0)\), and the realized event rate is
+`r format(mean(y), digits = 3)`.
+
+## Posterior Sampling via Stan
+
+```{r stan-model-and-fit}
+stan_code <- "
+data {
+  int<lower=1> N;
+  int<lower=1> D;
+  matrix[N, D] X;
+  array[N] int<lower=0, upper=1> y;
+  real<lower=0> tau;
+}
+parameters {
+  vector[D] beta;
+}
+model {
+  beta ~ normal(0, tau);
+  y ~ bernoulli_logit(X * beta);
+}
+generated quantities {
+  vector[N] log_lik;
+  for (i in 1:N) {
+    log_lik[i] = bernoulli_logit_lpmf(y[i] | dot_product(row(X, i), beta));
+  }
+}
+"
+
+stan_model_logit <- rstan::stan_model(model_code = stan_code)
+
+stan_data <- list(N = n, D = d, X = X, y = y, tau = tau)
+fit_post <- rstan::sampling(
+  object = stan_model_logit,
+  data = stan_data,
+  chains = 2,
+  iter = 800,
+  warmup = 400,
+  seed = 20260218,
+  refresh = 0,
+  control = list(adapt_delta = 0.9)
+)
+
+beta_draws <- geoess_draws(fit_post, pars = "beta", as = "matrix")
+colnames(beta_draws) <- colnames(X)
+
+# Posterior mean as a local reference point (via geoess helper)
+beta_post_mean <- as.numeric(geoess_theta_ref(beta_draws, ref = "posterior_mean"))
+names(beta_post_mean) <- colnames(X)
+
+# Prior mean reference point
+beta_prior_mean <- rep(0, d)
+names(beta_prior_mean) <- colnames(X)
+
+rbind(
+  prior_mean = beta_prior_mean,
+  posterior_mean = beta_post_mean
+)
+```
+
+```{r stan-model-and-fit-correlated}
+rho <- 0.6
+Sigma_prior_rho <- prior_covariance_gaussian(d = d, tau = tau, rho = rho)
+
+stan_code_corr <- "
+data {
+  int<lower=1> N;
+  int<lower=1> D;
+  matrix[N, D] X;
+  array[N] int<lower=0, upper=1> y;
+  cov_matrix[D] Sigma_prior;
+}
+transformed data {
+  vector[D] beta_mean = rep_vector(0, D);
+}
+parameters {
+  vector[D] beta;
+}
+model {
+  beta ~ multi_normal(beta_mean, Sigma_prior);
+  y ~ bernoulli_logit(X * beta);
+}
+generated quantities {
+  vector[N] log_lik;
+  for (i in 1:N) {
+    log_lik[i] = bernoulli_logit_lpmf(y[i] | dot_product(row(X, i), beta));
+  }
+}
+"
+
+stan_model_logit_corr <- rstan::stan_model(model_code = stan_code_corr)
+stan_data_corr <- list(N = n, D = d, X = X, y = y, Sigma_prior = Sigma_prior_rho)
+
+fit_post_rho <- rstan::sampling(
+  object = stan_model_logit_corr,
+  data = stan_data_corr,
+  chains = 2,
+  iter = 800,
+  warmup = 400,
+  seed = 20260220,
+  refresh = 0,
+  control = list(adapt_delta = 0.9)
+)
+
+beta_draws_rho <- geoess_draws(fit_post_rho, pars = "beta", as = "matrix")
+colnames(beta_draws_rho) <- colnames(X)
+
+beta_post_mean_rho <- as.numeric(geoess_theta_ref(beta_draws_rho, ref = "posterior_mean"))
+names(beta_post_mean_rho) <- colnames(X)
+
+rbind(
+  independent_posterior_mean = beta_post_mean,
+  correlated_posterior_mean = beta_post_mean_rho
+)
+```
+
+For more accurate posterior summaries and global ESS estimates, increase
+`iter`, `warmup`, or the number of chains.
+
+## Local ESS
+
+```{r local-ess}
+Ipi <- prior_curvature_gaussian(d = d, tau = tau)
+
+I1_at_prior_mean <- fisher_logistic_per_obs(beta_prior_mean, X)
+I1_at_post_mean <- fisher_logistic_per_obs(beta_post_mean, X)
+
+# Local ESS computed via geoess conventions: (1/d) tr(I1^{-1} Ipi)
+local_ess_prior_mean <- geoess_trace(I1_at_prior_mean, Ipi)
+local_ess_post_mean <- geoess_trace(I1_at_post_mean, Ipi)
+
+local_ess_table <- data.frame(
+  reference_point = c("Prior mean (0, 0)", "Posterior mean"),
+  local_ess = c(local_ess_prior_mean, local_ess_post_mean)
+)
+invisible(NULL)
+```
+
+```{r ess-spectrum}
+# ESS spectrum at the symmetry reference beta = (0, 0).
+# Because the covariate is centered, I1 is diagonal here and the independent
+# Gaussian prior yields coordinate eigenvectors.
+I1_at_symmetry_ref <- fisher_logistic_per_obs(beta_prior_mean, X)
+spec_post_mean <- geoess_spectrum(I1_at_symmetry_ref, Ipi)
+
+spectrum_values <- data.frame(
+  direction = paste0("eig", seq_along(spec_post_mean$values)),
+  eigenvalue = spec_post_mean$values
+)
+
+eigenvectors <- as.data.frame(spec_post_mean$vectors)
+colnames(eigenvectors) <- paste0("eig", seq_len(ncol(eigenvectors)))
+param_names <- rownames(spec_post_mean$vectors)
+if (is.null(param_names)) {
+  param_names <- colnames(X)
+}
+eigenvectors$parameter <- param_names
+eigenvectors <- eigenvectors[, c("parameter", setdiff(names(eigenvectors), "parameter"))]
+
+invisible(NULL)
+```
+
+## Correlated Gaussian Prior
+
+We now consider a correlated Gaussian prior with
+\[
+\beta \sim \mathcal{N}(0, \Sigma_\rho),
+\qquad
+\Sigma_\rho = \tau^2
+\begin{pmatrix}
+1 & \rho \\
+\rho & 1
+\end{pmatrix},
+\]
+using \(\rho = 0.6\). We keep the same dataset, but for the spectral
+comparison we evaluate ESS at the same symmetry reference point
+\(\beta = (0, 0)\). This makes the contrast with the independent prior clear:
+the likelihood information remains axis-aligned, and the anisotropy arises from
+the prior correlation.
+
+```{r correlated-prior}
+Ipi_rho <- prior_curvature_gaussian(d = d, tau = tau, rho = rho)
+I1_at_symmetry_ref_rho <- fisher_logistic_per_obs(beta_prior_mean, X)
+
+e_beta0 <- c(1, 0)
+e_beta1 <- c(0, 1)
+
+# Per-coordinate ESS summaries under the correlated prior.
+ess_beta0_rho <- geoess_dir(I1_at_symmetry_ref_rho, Ipi_rho, e_beta0)
+ess_beta1_rho <- geoess_dir(I1_at_symmetry_ref_rho, Ipi_rho, e_beta1)
+
+coord_ess_rho <- data.frame(
+  parameter = c("beta0", "beta1"),
+  marginal_ess = c(ess_beta0_rho, ess_beta1_rho)
+)
+
+spec_rho <- geoess_spectrum(I1_at_symmetry_ref_rho, Ipi_rho)
+
+eigenvalues_rho <- data.frame(
+  direction = paste0("eig", seq_along(spec_rho$values)),
+  eigenvalue = spec_rho$values
+)
+
+eigenvectors_rho <- as.data.frame(spec_rho$vectors)
+colnames(eigenvectors_rho) <- paste0("eig", seq_len(ncol(eigenvectors_rho)))
+param_names_rho <- rownames(spec_rho$vectors)
+if (is.null(param_names_rho)) {
+  param_names_rho <- colnames(X)
+}
+eigenvectors_rho$parameter <- param_names_rho
+eigenvectors_rho <- eigenvectors_rho[, c("parameter", setdiff(names(eigenvectors_rho), "parameter"))]
+
+invisible(NULL)
+```
+
+## Global ESS
+
+We report two weighting distributions:
+
+- Prior-averaged global ESS: \(Q = \pi(\beta)\).
+- Posterior-averaged global ESS: \(Q = \pi(\beta \mid y)\).
+- We report both the independent prior (\(\rho = 0\)) and the correlated prior
+  (\(\rho = 0.6\)).
+
+```{r global-ess}
+set.seed(20260219)
+
+n_mc <- min(400, nrow(beta_draws))
+idx_post <- sample(seq_len(nrow(beta_draws)), size = n_mc)
+beta_post_mc <- beta_draws[idx_post, , drop = FALSE]
+beta_prior_mc <- draw_prior_beta(n_draws = n_mc, d = d, tau = tau, rho = 0)
+
+set.seed(20260220)
+idx_post_rho <- sample(seq_len(nrow(beta_draws_rho)), size = n_mc)
+beta_post_mc_rho <- beta_draws_rho[idx_post_rho, , drop = FALSE]
+beta_prior_mc_rho <- draw_prior_beta(
+  n_draws = n_mc,
+  d = d,
+  Sigma_prior = Sigma_prior_rho
+)
+
+global_post <- geoess_global(
+  Q = list(draws = beta_post_mc, type = "posterior"),
+  I1 = function(theta) fisher_logistic_per_obs(theta, X),
+  Ipi = prior_curvature_gaussian(d = d, tau = tau, rho = 0),
+  method = "trace"
+)
+
+global_prior <- geoess_global(
+  Q = list(draws = beta_prior_mc, type = "prior"),
+  I1 = function(theta) fisher_logistic_per_obs(theta, X),
+  Ipi = prior_curvature_gaussian(d = d, tau = tau, rho = 0),
+  method = "trace"
+)
+
+global_post_rho <- geoess_global(
+  Q = list(draws = beta_post_mc_rho, type = "posterior"),
+  I1 = function(theta) fisher_logistic_per_obs(theta, X),
+  Ipi = Ipi_rho,
+  method = "trace"
+)
+
+global_prior_rho <- geoess_global(
+  Q = list(draws = beta_prior_mc_rho, type = "prior"),
+  I1 = function(theta) fisher_logistic_per_obs(theta, X),
+  Ipi = Ipi_rho,
+  method = "trace"
+)
+
+global_ess_table <- data.frame(
+  prior_structure = c(
+    "Independent (rho = 0)",
+    "Independent (rho = 0)",
+    "Correlated (rho = 0.6)",
+    "Correlated (rho = 0.6)"
+  ),
+  weighting_distribution = c(
+    "Prior (Q = pi(beta))",
+    "Posterior (Q = pi(beta | y))",
+    "Prior (Q = pi(beta))",
+    "Posterior (Q = pi(beta | y))"
+  ),
+  ess_global = c(
+    global_prior$estimate,
+    global_post$estimate,
+    global_prior_rho$estimate,
+    global_post_rho$estimate
+  ),
+  mcse = c(
+    global_prior$mcse,
+    global_post$mcse,
+    global_prior_rho$mcse,
+    global_post_rho$mcse
+  ),
+  n_draws = c(
+    global_prior$n,
+    global_post$n,
+    global_prior_rho$n,
+    global_post_rho$n
+  )
+)
+invisible(NULL)
+```
+
+## ESS Summary
+
+```{r ess-summary}
+I1_at_prior_mean_rho <- fisher_logistic_per_obs(beta_prior_mean, X)
+I1_at_post_mean_rho <- fisher_logistic_per_obs(beta_post_mean_rho, X)
+
+local_ess_prior_mean_rho <- geoess_trace(I1_at_prior_mean_rho, Ipi_rho)
+local_ess_post_mean_rho <- geoess_trace(I1_at_post_mean_rho, Ipi_rho)
+
+format_vec <- function(v, digits = 3) {
+  paste0("(", paste(format(round(v, digits), nsmall = digits, trim = TRUE), collapse = ", "), ")")
+}
+
+panel_a_display <- data.frame(
+  Scenario = c("Independent", sprintf("Correlated (rho = %.1f)", rho)),
+  `Local ESS<br>Prior mean` = c(local_ess_prior_mean, local_ess_prior_mean_rho),
+  `Local ESS<br>Posterior mean` = c(local_ess_post_mean, local_ess_post_mean_rho),
+  `Global ESS<br>Prior-avg` = c(global_prior$estimate, global_prior_rho$estimate),
+  `Global ESS<br>Posterior-avg` = c(global_post$estimate, global_post_rho$estimate),
+  check.names = FALSE
+)
+panel_a_display[-1] <- lapply(panel_a_display[-1], round, 1)
+
+panel_b_display <- data.frame(
+  Scenario = c("Independent", sprintf("Correlated (rho = %.1f)", rho)),
+  `Marginal ESS<br>beta0` = c(
+    geoess_dir(I1_at_symmetry_ref, Ipi, c(1, 0)),
+    ess_beta0_rho
+  ),
+  `Marginal ESS<br>beta1` = c(
+    geoess_dir(I1_at_symmetry_ref, Ipi, c(0, 1)),
+    ess_beta1_rho
+  ),
+  `Direction 1<br>(eigenvector)` = c(
+    "$(1,0)$",
+    paste0("$", format_vec(spec_rho$vectors[, 1]), "$")
+  ),
+  `Directional ESS 1<br>(eigenvalue)` = c(spec_post_mean$values[1], spec_rho$values[1]),
+  `Direction 2<br>(eigenvector)` = c(
+    "$(0,1)$",
+    paste0("$", format_vec(spec_rho$vectors[, 2]), "$")
+  ),
+  `Directional ESS 2<br>(eigenvalue)` = c(spec_post_mean$values[2], spec_rho$values[2]),
+  check.names = FALSE
+)
+panel_b_display[c(2, 3, 5, 7)] <- lapply(panel_b_display[c(2, 3, 5, 7)], round, 1)
+
+knitr::kable(
+  panel_a_display,
+  escape = FALSE,
+  caption = paste(
+    "Panel A: local and global ESS of the joint prior for logistic regression.",
+    "Local ESS is evaluated at the prior and posterior means; global ESS is",
+    "reported under prior and posterior averaging."
+  )
+)
+
+knitr::kable(
+  panel_b_display,
+  escape = FALSE,
+  caption = paste(
+    "Panel B: local marginal and directional ESS at the prior mean.",
+    "For the independent prior, the geometry is coordinate-aligned, so the",
+    "marginal and directional ESS coincide. Under the correlated prior, the",
+    "eigenvectors rotate away from the coordinate axes and the directional ESS",
+    "reveals stronger anisotropy."
+  )
+)
+```
+
+Panel A summarizes the local and global ESS for the joint prior under both
+independent and correlated Gaussian scenarios. A useful pattern appears in both
+cases: local ESS is larger at the posterior mean than at the prior mean, but
+global ESS is larger under prior averaging than under posterior averaging. This
+is not a contradiction. ESS measures prior informativeness relative to the unit
+of data, not absolute informativeness of a point. At the prior mean, the data
+are locally more informative than at the posterior mean; equivalently, the
+prior has more local influence at the posterior mean. For the global summaries,
+the prior distribution is broader than the posterior and therefore places more
+weight on tail regions where the logistic likelihood is flatter. Those
+low-information tail regions inflate the prior-averaged ESS relative to the
+posterior-averaged ESS.
+
+Panel B reports local marginal and directional ESS at the prior mean. Under the
+independent prior, the centered design makes the relative information geometry
+essentially coordinate-aligned, so the marginal ESS and the directional ESS are
+the same. Under the correlated prior, the principal directions rotate away from
+the coordinate axes and the directional ESS becomes notably anisotropic. In
+that setting, the marginal ESS is similar across \(\beta_0\) and \(\beta_1\),
+but the directional ESS differs sharply across the two eigen-directions. This
+illustrates why multiple ESS summaries are useful even in a two-parameter
+example.
+
+## Sensitivity Analyses
+
+We vary \(\tau \in \{0.5, 1, 2\}\), keeping the same dataset, and compare
+independent and correlated Gaussian priors. Each setting runs a short Stan fit
+to keep vignette runtime moderate.
+
+```{r sensitivity-tau}
+run_tau_sensitivity <- function(tau_value, rho_value, stan_model_indep,
+                                stan_model_corr, X, y, seed_offset = 0) {
+  d_loc <- ncol(X)
+  Sigma_tau <- prior_covariance_gaussian(d = d_loc, tau = tau_value, rho = rho_value)
+
+  if (abs(rho_value) < sqrt(.Machine$double.eps)) {
+    data_tau <- list(N = nrow(X), D = d_loc, X = X, y = y, tau = tau_value)
+    fit_tau <- rstan::sampling(
+      object = stan_model_indep,
+      data = data_tau,
+      chains = 1,
+      iter = 500,
+      warmup = 250,
+      seed = 20261000 + seed_offset,
+      refresh = 0,
+      control = list(adapt_delta = 0.9)
+    )
+  } else {
+    data_tau <- list(N = nrow(X), D = d_loc, X = X, y = y, Sigma_prior = Sigma_tau)
+    fit_tau <- rstan::sampling(
+      object = stan_model_corr,
+      data = data_tau,
+      chains = 1,
+      iter = 500,
+      warmup = 250,
+      seed = 20261000 + seed_offset,
+      refresh = 0,
+      control = list(adapt_delta = 0.9)
+    )
+  }
+
+  draws_tau <- geoess_draws(fit_tau, pars = "beta", as = "matrix")
+  colnames(draws_tau) <- colnames(X)
+
+  beta_mean_tau <- as.numeric(geoess_theta_ref(draws_tau, ref = "posterior_mean"))
+  Ipi_tau <- prior_curvature_gaussian(d = d_loc, tau = tau_value, rho = rho_value)
+  local_tau <- geoess_trace(fisher_logistic_per_obs(beta_mean_tau, X), Ipi_tau)
+
+  m_tau <- min(300, nrow(draws_tau))
+  set.seed(20262000 + 10 * seed_offset)
+  idx_tau <- sample(seq_len(nrow(draws_tau)), size = m_tau)
+  draws_post_tau <- draws_tau[idx_tau, , drop = FALSE]
+  set.seed(20263000 + 10 * seed_offset)
+  draws_prior_tau <- draw_prior_beta(
+    n_draws = m_tau,
+    d = d_loc,
+    Sigma_prior = Sigma_tau
+  )
+
+  g_post_tau <- geoess_global(
+    Q = list(draws = draws_post_tau, type = "posterior"),
+    I1 = function(theta) fisher_logistic_per_obs(theta, X),
+    Ipi = Ipi_tau,
+    method = "trace"
+  )
+
+  g_prior_tau <- geoess_global(
+    Q = list(draws = draws_prior_tau, type = "prior"),
+    I1 = function(theta) fisher_logistic_per_obs(theta, X),
+    Ipi = Ipi_tau,
+    method = "trace"
+  )
+
+  data.frame(
+    prior_structure = if (abs(rho_value) < sqrt(.Machine$double.eps)) {
+      "Independent (rho = 0)"
+    } else {
+      sprintf("Correlated (rho = %.1f)", rho_value)
+    },
+    rho = rho_value,
+    tau = tau_value,
+    local_ess_at_post_mean = local_tau,
+    global_ess_prior = g_prior_tau$estimate,
+    mcse_prior = g_prior_tau$mcse,
+    global_ess_posterior = g_post_tau$estimate,
+    mcse_posterior = g_post_tau$mcse
+  )
+}
+
+tau_grid <- c(0.5, 1, 2)
+rho_grid <- c(0, 0.6)
+sensitivity_tau <- do.call(rbind, lapply(seq_along(rho_grid), function(j) {
+  do.call(
+    rbind,
+    lapply(seq_along(tau_grid), function(i) {
+      run_tau_sensitivity(
+        tau_value = tau_grid[i],
+        rho_value = rho_grid[j],
+        stan_model_indep = stan_model_logit,
+        stan_model_corr = stan_model_logit_corr,
+        X = X,
+        y = y,
+        seed_offset = 10 * j + i
+      )
+    })
+  )
+}))
+
+sensitivity_tau
+```
+
+Optional extension to higher dimension (e.g., \(d=5\)):
+
+```{r optional-d5, eval=FALSE}
+# Example sketch for d = 5 (intercept + 4 covariates)
+# x_mat <- scale(matrix(rnorm(n * 4), nrow = n, ncol = 4))
+# X5 <- cbind(1, x_mat)
+# beta_true5 <- c(-0.5, 1.0, -0.75, 0.5, 0.25)
+# y5 <- rbinom(n, 1, plogis(X5 %*% beta_true5))
+# Then reuse the same Stan model with D = 5 and repeat local/global ESS steps.
+```
+
+## Discussion
+
+This non-conjugate example illustrates the geometric ESS workflow in a model
+where curvature depends on both the reference point and the weighting
+distribution. The independent and correlated priors show the same qualitative
+local/global reversal, but they differ substantially in their directional
+structure. The independent prior is essentially coordinate-aligned, whereas the
+correlated prior rotates the principal directions and induces stronger
+anisotropy. Together, these summaries show that a single scalar ESS is often
+not enough to describe prior informativeness fully in nonconjugate regression
+models.

@@ -1,0 +1,14 @@
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+.vscode/
+.codex
+
+Rplots.pdf
+
+*.Rcheck/
+*.tar.gz
+
+vignette/*.html
+vignette/.Rhistory

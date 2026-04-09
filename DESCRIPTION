@@ -1,0 +1,19 @@
+Package: geoess
+Title: Geometric Effective Sample Size
+Version: 0.1.0
+Authors@R: person("Xuetao", "Lu", email = "lxtpvt@gmail.com", role = c("aut", "cre"))
+Description: Implements a geometry-first Information Geometry package for calculating Effective Sample Size (ESS) using Fisher-Rao metric and Godambe information.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+RoxygenNote: 7.3.3
+Imports: 
+    numDeriv,
+    Matrix,
+    mvtnorm,
+    sandwich,
+    rstan
+Suggests: 
+    testthat (>= 3.0.0),
+    cmdstanr
+Config/testthat/edition: 3

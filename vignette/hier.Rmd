@@ -1,0 +1,1068 @@
+---
+title: "ESS for multi-groups borrowing with Hierarchical Models"
+output: html_vignette
+vignette: >
+  %\VignetteIndexEntry{ESS for multi-groups borrowing with Hierarchical Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 4.5
+)
+
+set.seed(20260218)
+
+library(geoess)
+library(rstan)
+
+rstan::rstan_options(auto_write = FALSE)
+options(mc.cores = 2)
+```
+
+## Introduction
+
+This vignette demonstrates geometric effective sample size (ESS) for
+multi-group borrowing in a Normal--Normal hierarchical model. We focus on:
+
+- local block ESS for hyperparameters \(\phi = (\mu, \tau^2)\),
+- local conditional ESS for group effects \(\theta_i \mid \phi\) on both the
+  per-observation and per-group scales, and
+- global ESS under prior and posterior weighting distributions.
+
+The workflow follows geometric definitions in `geoess`, where local ESS is
+curvature-based and global ESS is an average of local ESS under a chosen
+weighting distribution \(Q\).
+
+## Model
+
+We use the hierarchical model
+\[
+y_{ij} \mid \theta_i, \sigma_i^2 \sim \mathcal{N}(\theta_i, \sigma_i^2),
+\qquad i=1,\dots,K,
+\]
+\[
+\theta_i \mid \mu, \tau^2 \sim \mathcal{N}(\mu, \tau^2),
+\qquad
+\mu \sim \mathcal{N}(m_0, s_0^2),
+\qquad
+\tau^2 \sim \operatorname{InvGamma}(a_\tau, b_\tau).
+\]
+
+Within-group variances are treated by plug-in estimates,
+\[
+\widehat{\sigma}_i^2 = \operatorname{var}(y_i),
+\]
+which are used as known inputs in likelihood-level unit information for
+\(\theta_i\).
+
+For hyperparameters \(\phi = (\mu, \tau^2)\), per-group unit information is
+\[
+I_{1,\phi}(\tau^2)
+=
+\begin{pmatrix}
+1/\tau^2 & 0 \\
+0 & 1/(2\tau^4)
+\end{pmatrix}.
+\]
+
+## Simulation Design
+
+```{r simulation-design}
+# Baseline simulation settings
+K <- 10
+# Use heterogeneous group sizes to reflect a more realistic multi-group study.
+set.seed(20260217)
+n_i <- sample(c(3, 5, 8, 12, 18, 24, 30, 35, 45, 60), size = K, replace = FALSE)
+mu0 <- 0
+tau0 <- 0.5
+tau0_sq <- tau0^2
+
+# Hyperprior settings for fitting and ESS calculations
+m0 <- 0
+s0 <- 1
+a_tau <- 3
+b_tau <- 0.5
+
+simulate_hier_data <- function(K, n_i, mu0, tau0, seed = 1) {
+  set.seed(seed)
+  if (length(n_i) == 1L) n_i <- rep(n_i, K)
+
+  # Heterogeneous within-group SDs
+  sigma_true <- sample(c(0.5, 1, 2), size = K, replace = TRUE)
+  sigma_true2 <- sigma_true^2
+
+  theta_true <- rnorm(K, mean = mu0, sd = tau0)
+  y_list <- lapply(seq_len(K), function(i) {
+    rnorm(n_i[i], mean = theta_true[i], sd = sigma_true[i])
+  })
+
+  sigma_hat2 <- vapply(y_list, var, numeric(1))
+
+  list(
+    K = K,
+    n_i = n_i,
+    mu0 = mu0,
+    tau0 = tau0,
+    tau0_sq = tau0^2,
+    theta_true = theta_true,
+    sigma_true2 = sigma_true2,
+    y_list = y_list,
+    sigma_hat2 = sigma_hat2
+  )
+}
+
+sim <- simulate_hier_data(K = K, n_i = n_i, mu0 = mu0, tau0 = tau0, seed = 20260218)
+
+data.frame(
+  K = sim$K,
+  n_min = min(sim$n_i),
+  n_mean = mean(sim$n_i),
+  n_max = max(sim$n_i),
+  n_i = paste(sim$n_i, collapse = ", "),
+  true_mu0 = sim$mu0,
+  true_tau0_sq = sim$tau0_sq,
+  mean_sigma_true_sq = mean(sim$sigma_true2),
+  mean_sigma_hat_sq = mean(sim$sigma_hat2)
+)
+```
+
+The baseline simulation uses \(K=10\) groups with heterogeneous group sizes
+\(\{n_1,\dots,n_{10}\} = \{\) `r paste(sim$n_i, collapse = ", ")` \(\}\), true
+\(\mu_0 = 0\), true \(\tau_0^2 = 0.25\), and hyperparameters
+\(m_0 = 0\), \(s_0 = 1\), \(a_\tau = 3\), and \(b_\tau = 0.5\). The plug-in
+within-group variances \(\widehat{\sigma}_i^2\) range from
+`r format(min(sim$sigma_hat2), digits = 3)` to
+`r format(max(sim$sigma_hat2), digits = 3)`, with mean
+`r format(mean(sim$sigma_hat2), digits = 3)`.
+
+## Stan Implementation
+
+```{r stan-implementation}
+hier_stan_code <- "
+data {
+  int<lower=1> N;
+  int<lower=1> K;
+  array[N] int<lower=1, upper=K> group;
+  vector[N] y;
+  vector<lower=0>[K] sigma_hat;
+  real m0;
+  real<lower=0> s0;
+  real<lower=0> a_tau;
+  real<lower=0> b_tau;
+}
+parameters {
+  vector[K] theta;
+  real mu;
+  real<lower=0> tau2;
+}
+model {
+  mu ~ normal(m0, s0);
+  tau2 ~ inv_gamma(a_tau, b_tau);
+  theta ~ normal(mu, sqrt(tau2));
+
+  for (n in 1:N) {
+    y[n] ~ normal(theta[group[n]], sigma_hat[group[n]]);
+  }
+}
+"
+
+make_stan_data <- function(sim, m0, s0, a_tau, b_tau) {
+  y <- unlist(sim$y_list)
+  group <- rep(seq_len(sim$K), times = sim$n_i)
+  list(
+    N = length(y),
+    K = sim$K,
+    group = as.integer(group),
+    y = as.numeric(y),
+    sigma_hat = sqrt(sim$sigma_hat2),
+    m0 = m0,
+    s0 = s0,
+    a_tau = a_tau,
+    b_tau = b_tau
+  )
+}
+
+stan_model_hier <- rstan::stan_model(model_code = hier_stan_code)
+stan_data <- make_stan_data(sim, m0, s0, a_tau, b_tau)
+
+fit_hier <- rstan::sampling(
+  object = stan_model_hier,
+  data = stan_data,
+  chains = 2,
+  iter = 700,
+  warmup = 350,
+  seed = 20260218,
+  refresh = 0,
+  control = list(adapt_delta = 0.9)
+)
+
+theta_draws <- geoess_draws(fit_hier, pars = "theta", as = "matrix")
+mu_draws <- as.numeric(geoess_draws(fit_hier, pars = "mu", as = "matrix"))
+tau2_draws <- as.numeric(geoess_draws(fit_hier, pars = "tau2", as = "matrix"))
+
+theta_pars <- colnames(theta_draws)
+phi_pars <- c("mu", "tau2")
+
+post_draws <- cbind(theta_draws, mu = mu_draws, tau2 = tau2_draws)
+
+# Prior draws for prior-averaged global ESS
+n_prior <- nrow(post_draws)
+set.seed(20260219)
+mu_prior <- rnorm(n_prior, mean = m0, sd = s0)
+tau2_prior <- 1 / rgamma(n_prior, shape = a_tau, rate = b_tau)
+theta_prior <- t(vapply(seq_len(n_prior), function(s) {
+  rnorm(sim$K, mean = mu_prior[s], sd = sqrt(tau2_prior[s]))
+}, numeric(sim$K)))
+
+colnames(theta_prior) <- theta_pars
+prior_draws <- cbind(theta_prior, mu = mu_prior, tau2 = tau2_prior)
+
+summary(tau2_draws)
+```
+
+For more accurate posterior/global ESS summaries, increase `iter`, `warmup`,
+and number of chains.
+
+## Local ESS: Block vs Conditional
+
+```{r local-ess-helpers}
+build_full_matrix <- function(M_theta, M_thetaphi, M_phi) {
+  rbind(
+    cbind(M_theta, M_thetaphi),
+    cbind(t(M_thetaphi), M_phi)
+  )
+}
+
+split_full_matrix <- function(M_full, K) {
+  idx_theta <- seq_len(K)
+  idx_phi <- (K + 1):(K + 2)
+  list(
+    Htt = M_full[idx_theta, idx_theta, drop = FALSE],
+    Htp = M_full[idx_theta, idx_phi, drop = FALSE],
+    Hpp = M_full[idx_phi, idx_phi, drop = FALSE]
+  )
+}
+
+clip_psd <- function(M) {
+  M <- 0.5 * (M + t(M))
+  ev <- eigen(M, symmetric = TRUE)
+  ev$values[ev$values < 0] <- 0
+  ev$vectors %*% diag(ev$values, nrow = length(ev$values)) %*% t(ev$vectors)
+}
+
+prior_curvature_blocks <- function(theta, mu, tau2, m0, s0, a_tau, b_tau) {
+  K <- length(theta)
+  delta <- theta - mu
+  s1 <- sum(delta)
+  s2 <- sum(delta^2)
+
+  Htt <- diag(1 / tau2, K)
+  Htp <- cbind(
+    mu = rep(-1 / tau2, K),
+    tau2 = -(delta) / (tau2^2)
+  )
+
+  Hpp11 <- K / tau2 + 1 / (s0^2)
+  Hpp12 <- s1 / (tau2^2)
+  Hpp22 <- (s2 + 2 * b_tau) / (tau2^3) - (K / 2 + a_tau + 1) / (tau2^2)
+  Hpp <- matrix(c(Hpp11, Hpp12, Hpp12, Hpp22), nrow = 2, byrow = TRUE)
+  Hpp <- 0.5 * (Hpp + t(Hpp))
+
+  list(Htt = Htt, Htp = Htp, Hpp = Hpp)
+}
+
+unit_info_phi <- function(tau2) {
+  matrix(c(
+    1 / tau2, 0,
+    0, 1 / (2 * tau2^2)
+  ), nrow = 2, byrow = TRUE)
+}
+
+local_ess_summary <- function(theta_ref, mu_ref, tau2_ref, sigma_hat2, n_i,
+                              m0, s0, a_tau, b_tau) {
+  K <- length(theta_ref)
+
+  blocks <- prior_curvature_blocks(
+    theta = theta_ref,
+    mu = mu_ref,
+    tau2 = tau2_ref,
+    m0 = m0,
+    s0 = s0,
+    a_tau = a_tau,
+    b_tau = b_tau
+  )
+
+  I1_theta <- diag(1 / sigma_hat2, K)
+  I1_phi <- unit_info_phi(tau2_ref)
+
+  I1_full <- build_full_matrix(I1_theta, matrix(0, nrow = K, ncol = 2), I1_phi)
+  Ipi_full <- build_full_matrix(blocks$Htt, blocks$Htp, blocks$Hpp)
+  Ipi_full_clip <- clip_psd(Ipi_full)
+  blocks_clip <- split_full_matrix(Ipi_full_clip, K)
+
+  idx_phi <- (K + 1):(K + 2)
+  ess_theta_cond <- vapply(seq_len(K), function(i) {
+    geoess_conditional(
+      I1 = I1_full,
+      Ipi = Ipi_full,
+      idx_a = i,
+      idx_b = idx_phi,
+      method = "scalar"
+    )$ess_cond
+  }, numeric(1))
+  ess_theta_cond_clip <- vapply(seq_len(K), function(i) {
+    geoess_conditional(
+      I1 = I1_full,
+      Ipi = Ipi_full_clip,
+      idx_a = i,
+      idx_b = idx_phi,
+      method = "scalar"
+    )$ess_cond
+  }, numeric(1))
+  ess_theta_cond_per_group <- ess_theta_cond / n_i
+  ess_theta_cond_per_group_clip <- ess_theta_cond_clip / n_i
+
+  ess_phi_block <- geoess_trace(I1_phi, blocks$Hpp)
+  ess_phi_block_clip <- geoess_trace(I1_phi, blocks_clip$Hpp)
+  ess_mu <- blocks$Hpp[1, 1] / I1_phi[1, 1]
+  ess_mu_clip <- blocks_clip$Hpp[1, 1] / I1_phi[1, 1]
+  ess_tau2 <- blocks$Hpp[2, 2] / I1_phi[2, 2]
+  ess_tau2_clip <- blocks_clip$Hpp[2, 2] / I1_phi[2, 2]
+
+  list(
+    ess_phi_block = ess_phi_block,
+    ess_phi_block_clip = ess_phi_block_clip,
+    ess_mu = ess_mu,
+    ess_mu_clip = ess_mu_clip,
+    ess_tau2 = ess_tau2,
+    ess_tau2_clip = ess_tau2_clip,
+    ess_theta_cond_per_obs = ess_theta_cond,
+    ess_theta_cond_per_obs_clip = ess_theta_cond_clip,
+    ess_theta_cond_per_group = ess_theta_cond_per_group,
+    ess_theta_cond_per_group_clip = ess_theta_cond_per_group_clip,
+    I1_phi = I1_phi,
+    Ipi_phi = blocks$Hpp,
+    Ipi_phi_clip = blocks_clip$Hpp
+  )
+}
+```
+
+```{r local-ess-computation}
+# Reference points
+mu_ref_prior <- m0
+tau2_ref_prior <- b_tau / (a_tau + 1)  # prior mode for Inv-Gamma(a_tau, b_tau)
+theta_ref_prior <- rep(mu_ref_prior, sim$K)
+
+mu_ref_post <- mean(mu_draws)
+tau2_ref_post <- mean(tau2_draws)
+theta_ref_post <- colMeans(theta_draws)
+
+loc_prior <- local_ess_summary(
+  theta_ref = theta_ref_prior,
+  mu_ref = mu_ref_prior,
+  tau2_ref = tau2_ref_prior,
+  sigma_hat2 = sim$sigma_hat2,
+  n_i = sim$n_i,
+  m0 = m0,
+  s0 = s0,
+  a_tau = a_tau,
+  b_tau = b_tau
+)
+
+loc_post <- local_ess_summary(
+  theta_ref = theta_ref_post,
+  mu_ref = mu_ref_post,
+  tau2_ref = tau2_ref_post,
+  sigma_hat2 = sim$sigma_hat2,
+  n_i = sim$n_i,
+  m0 = m0,
+  s0 = s0,
+  a_tau = a_tau,
+  b_tau = b_tau
+)
+
+local_table <- data.frame(
+  reference = c("Prior reference", "Posterior mean reference"),
+  ESS_phi_block_per_group = c(loc_prior$ess_phi_block, loc_post$ess_phi_block),
+  ESS_phi_block_per_group_clip = c(loc_prior$ess_phi_block_clip, loc_post$ess_phi_block_clip),
+  ESS_mu_per_group = c(loc_prior$ess_mu, loc_post$ess_mu),
+  ESS_mu_per_group_clip = c(loc_prior$ess_mu_clip, loc_post$ess_mu_clip),
+  ESS_tau2_per_group = c(loc_prior$ess_tau2, loc_post$ess_tau2),
+  ESS_tau2_per_group_clip = c(loc_prior$ess_tau2_clip, loc_post$ess_tau2_clip),
+  mean_ESS_theta_cond_per_obs = c(mean(loc_prior$ess_theta_cond_per_obs), mean(loc_post$ess_theta_cond_per_obs)),
+  mean_ESS_theta_cond_per_obs_clip = c(mean(loc_prior$ess_theta_cond_per_obs_clip), mean(loc_post$ess_theta_cond_per_obs_clip)),
+  median_ESS_theta_cond_per_obs = c(median(loc_prior$ess_theta_cond_per_obs), median(loc_post$ess_theta_cond_per_obs)),
+  median_ESS_theta_cond_per_obs_clip = c(median(loc_prior$ess_theta_cond_per_obs_clip), median(loc_post$ess_theta_cond_per_obs_clip)),
+  mean_ESS_theta_cond_per_group = c(mean(loc_prior$ess_theta_cond_per_group), mean(loc_post$ess_theta_cond_per_group)),
+  mean_ESS_theta_cond_per_group_clip = c(mean(loc_prior$ess_theta_cond_per_group_clip), mean(loc_post$ess_theta_cond_per_group_clip)),
+  median_ESS_theta_cond_per_group = c(median(loc_prior$ess_theta_cond_per_group), median(loc_post$ess_theta_cond_per_group)),
+  median_ESS_theta_cond_per_group_clip = c(median(loc_prior$ess_theta_cond_per_group_clip), median(loc_post$ess_theta_cond_per_group_clip))
+)
+
+local_group_table <- data.frame(
+  group = seq_len(sim$K),
+  n_i = sim$n_i,
+  sigma_hat2 = sim$sigma_hat2,
+  ESS_local_prior_ref_per_obs = loc_prior$ess_theta_cond_per_obs,
+  ESS_local_prior_ref_per_obs_clip = loc_prior$ess_theta_cond_per_obs_clip,
+  ESS_local_post_ref_per_obs = loc_post$ess_theta_cond_per_obs,
+  ESS_local_post_ref_per_obs_clip = loc_post$ess_theta_cond_per_obs_clip,
+  ESS_local_prior_ref_per_group = loc_prior$ess_theta_cond_per_group,
+  ESS_local_prior_ref_per_group_clip = loc_prior$ess_theta_cond_per_group_clip,
+  ESS_local_post_ref_per_group = loc_post$ess_theta_cond_per_group,
+  ESS_local_post_ref_per_group_clip = loc_post$ess_theta_cond_per_group_clip
+)
+
+summarize_group_ess <- function(x) {
+  c(
+    mean = mean(x),
+    median = median(x),
+    q10 = as.numeric(stats::quantile(x, probs = 0.10)),
+    q90 = as.numeric(stats::quantile(x, probs = 0.90))
+  )
+}
+
+local_group_summary <- data.frame(
+  reference = c(
+    "Local prior reference per observation (signed)",
+    "Local posterior reference per observation (signed)",
+    "Local prior reference per observation (clipped)",
+    "Local posterior reference per observation (clipped)",
+    "Local prior reference per group (signed)",
+    "Local posterior reference per group (signed)",
+    "Local prior reference per group (clipped)",
+    "Local posterior reference per group (clipped)"
+  ),
+  rbind(
+    summarize_group_ess(loc_prior$ess_theta_cond_per_obs),
+    summarize_group_ess(loc_post$ess_theta_cond_per_obs),
+    summarize_group_ess(loc_prior$ess_theta_cond_per_obs_clip),
+    summarize_group_ess(loc_post$ess_theta_cond_per_obs_clip),
+    summarize_group_ess(loc_prior$ess_theta_cond_per_group),
+    summarize_group_ess(loc_post$ess_theta_cond_per_group),
+    summarize_group_ess(loc_prior$ess_theta_cond_per_group_clip),
+    summarize_group_ess(loc_post$ess_theta_cond_per_group_clip)
+  ),
+  row.names = NULL
+)
+invisible(NULL)
+```
+
+```{r local-ess-plot}
+plot(
+  sim$sigma_hat2,
+  loc_post$ess_theta_cond_per_obs,
+  pch = 19,
+  col = "steelblue",
+  xlab = expression(hat(sigma)[i]^2),
+  ylab = expression(ESS[theta[i] ~ "|" ~ phi]^local ~ "(per observation)"),
+  main = expression("Local Per-Observation ESS at Posterior Reference vs " * hat(sigma)[i]^2)
+)
+text(sim$sigma_hat2, loc_post$ess_theta_cond_per_obs, labels = seq_len(sim$K), pos = 3, cex = 0.75)
+```
+
+In this model, \(I_{1,\theta_i\mid\phi} = I_{1,\theta_i} = 1/\widehat{\sigma}_i^2\)
+because observation-level likelihood terms involve \(\theta_i\) but not
+\(\phi=(\mu,\tau^2)\), so \(I_{1,\theta\phi}=0\).
+
+```{r anisotropy-phi}
+phi_spectrum_post <- geoess_spectrum(loc_post$I1_phi, loc_post$Ipi_phi)
+
+data.frame(
+  direction = c("eig1", "eig2"),
+  value = phi_spectrum_post$values
+)
+```
+
+## Global ESS: Prior- vs Posterior-Averaged
+
+```{r global-ess-helpers}
+make_ipi_provider <- function(K, m0, s0, a_tau, b_tau, clip = FALSE) {
+  force(K); force(m0); force(s0); force(a_tau); force(b_tau)
+  force(clip)
+  function(Theta, ...) {
+    theta <- Theta[seq_len(K)]
+    mu <- Theta[K + 1]
+    tau2 <- Theta[K + 2]
+    blocks <- prior_curvature_blocks(theta, mu, tau2, m0, s0, a_tau, b_tau)
+    if (isTRUE(clip)) {
+      Ipi_full <- build_full_matrix(blocks$Htt, blocks$Htp, blocks$Hpp)
+      Ipi_full <- clip_psd(Ipi_full)
+      return(list(Ipi_full = Ipi_full))
+    }
+    list(
+      Ipi_thetatheta = blocks$Htt,
+      Ipi_thetaphi = blocks$Htp,
+      Ipi_phiphi = blocks$Hpp
+    )
+  }
+}
+
+make_i1_provider <- function(K, sigma_hat2) {
+  force(K); force(sigma_hat2)
+  function(Theta, ...) {
+    tau2 <- Theta[K + 2]
+    list(
+      I1_thetatheta = diag(1 / sigma_hat2, K),
+      I1_thetaphi = matrix(0, nrow = K, ncol = 2),
+      I1_phiphi = unit_info_phi(tau2)
+    )
+  }
+}
+
+ipi_provider <- make_ipi_provider(sim$K, m0, s0, a_tau, b_tau, clip = FALSE)
+ipi_provider_clip <- make_ipi_provider(sim$K, m0, s0, a_tau, b_tau, clip = TRUE)
+i1_provider <- make_i1_provider(sim$K, sim$sigma_hat2)
+```
+
+```{r global-ess-computation}
+res_global_prior <- geoess_hier_global(
+  Q = "custom",
+  draws = prior_draws,
+  pars_theta = theta_pars,
+  pars_phi = phi_pars,
+  group_index = seq_len(sim$K),
+  Ipi_provider = ipi_provider,
+  I1_provider = i1_provider,
+  return_by_group = TRUE
+)
+
+res_global_prior_clip <- geoess_hier_global(
+  Q = "custom",
+  draws = prior_draws,
+  pars_theta = theta_pars,
+  pars_phi = phi_pars,
+  group_index = seq_len(sim$K),
+  Ipi_provider = ipi_provider_clip,
+  I1_provider = i1_provider,
+  return_by_group = TRUE
+)
+
+res_global_post <- geoess_hier_global(
+  Q = "custom",
+  draws = post_draws,
+  pars_theta = theta_pars,
+  pars_phi = phi_pars,
+  group_index = seq_len(sim$K),
+  Ipi_provider = ipi_provider,
+  I1_provider = i1_provider,
+  return_by_group = TRUE
+)
+
+res_global_post_clip <- geoess_hier_global(
+  Q = "custom",
+  draws = post_draws,
+  pars_theta = theta_pars,
+  pars_phi = phi_pars,
+  group_index = seq_len(sim$K),
+  Ipi_provider = ipi_provider_clip,
+  I1_provider = i1_provider,
+  return_by_group = TRUE
+)
+
+global_table <- data.frame(
+  weighting_distribution = c("Prior (Q = pi(Theta))", "Posterior (Q = pi(Theta | y))"),
+  global_ESS_phi_block_per_group = c(
+    res_global_prior$ess_phi_global$estimate,
+    res_global_post$ess_phi_global$estimate
+  ),
+  global_ESS_phi_block_per_group_clip = c(
+    res_global_prior_clip$ess_phi_global$estimate,
+    res_global_post_clip$ess_phi_global$estimate
+  ),
+  MCSE_phi_block = c(
+    res_global_prior$ess_phi_global$mcse,
+    res_global_post$ess_phi_global$mcse
+  ),
+  MCSE_phi_block_clip = c(
+    res_global_prior_clip$ess_phi_global$mcse,
+    res_global_post_clip$ess_phi_global$mcse
+  ),
+  mean_ESS_theta_cond_per_obs = c(
+    mean(res_global_prior$ess_theta_cond_global),
+    mean(res_global_post$ess_theta_cond_global)
+  ),
+  mean_ESS_theta_cond_per_obs_clip = c(
+    mean(res_global_prior_clip$ess_theta_cond_global),
+    mean(res_global_post_clip$ess_theta_cond_global)
+  ),
+  median_ESS_theta_cond_per_obs = c(
+    median(res_global_prior$ess_theta_cond_global),
+    median(res_global_post$ess_theta_cond_global)
+  ),
+  median_ESS_theta_cond_per_obs_clip = c(
+    median(res_global_prior_clip$ess_theta_cond_global),
+    median(res_global_post_clip$ess_theta_cond_global)
+  ),
+  mean_ESS_theta_cond_per_group = c(
+    mean(res_global_prior$ess_theta_cond_global / sim$n_i),
+    mean(res_global_post$ess_theta_cond_global / sim$n_i)
+  ),
+  mean_ESS_theta_cond_per_group_clip = c(
+    mean(res_global_prior_clip$ess_theta_cond_global / sim$n_i),
+    mean(res_global_post_clip$ess_theta_cond_global / sim$n_i)
+  ),
+  median_ESS_theta_cond_per_group = c(
+    median(res_global_prior$ess_theta_cond_global / sim$n_i),
+    median(res_global_post$ess_theta_cond_global / sim$n_i)
+  ),
+  median_ESS_theta_cond_per_group_clip = c(
+    median(res_global_prior_clip$ess_theta_cond_global / sim$n_i),
+    median(res_global_post_clip$ess_theta_cond_global / sim$n_i)
+  )
+)
+
+global_group_post_table <- data.frame(
+  group = seq_len(sim$K),
+  n_i = sim$n_i,
+  sigma_hat2 = sim$sigma_hat2,
+  ESS_global_post_per_obs = res_global_post$ess_theta_cond_global,
+  ESS_global_post_per_obs_clip = res_global_post_clip$ess_theta_cond_global,
+  ESS_global_post_per_group = res_global_post$ess_theta_cond_global / sim$n_i,
+  ESS_global_post_per_group_clip = res_global_post_clip$ess_theta_cond_global / sim$n_i,
+  MCSE_per_obs = res_global_post$ess_theta_mcse,
+  MCSE_per_obs_clip = res_global_post_clip$ess_theta_mcse,
+  MCSE_per_group = res_global_post$ess_theta_mcse / sim$n_i,
+  MCSE_per_group_clip = res_global_post_clip$ess_theta_mcse / sim$n_i
+)
+
+global_group_prior_table <- data.frame(
+  group = seq_len(sim$K),
+  n_i = sim$n_i,
+  ESS_global_prior_per_obs = res_global_prior$ess_theta_cond_global,
+  ESS_global_prior_per_obs_clip = res_global_prior_clip$ess_theta_cond_global,
+  ESS_global_prior_per_group = res_global_prior$ess_theta_cond_global / sim$n_i,
+  ESS_global_prior_per_group_clip = res_global_prior_clip$ess_theta_cond_global / sim$n_i,
+  MCSE_per_obs = res_global_prior$ess_theta_mcse,
+  MCSE_per_obs_clip = res_global_prior_clip$ess_theta_mcse,
+  MCSE_per_group = res_global_prior$ess_theta_mcse / sim$n_i,
+  MCSE_per_group_clip = res_global_prior_clip$ess_theta_mcse / sim$n_i
+)
+
+global_group_summary <- data.frame(
+  source = c(
+    "Global prior per observation (signed)",
+    "Global posterior per observation (signed)",
+    "Global prior per observation (clipped)",
+    "Global posterior per observation (clipped)",
+    "Global prior per group (signed)",
+    "Global posterior per group (signed)",
+    "Global prior per group (clipped)",
+    "Global posterior per group (clipped)"
+  ),
+  rbind(
+    summarize_group_ess(res_global_prior$ess_theta_cond_global),
+    summarize_group_ess(res_global_post$ess_theta_cond_global),
+    summarize_group_ess(res_global_prior_clip$ess_theta_cond_global),
+    summarize_group_ess(res_global_post_clip$ess_theta_cond_global),
+    summarize_group_ess(res_global_prior$ess_theta_cond_global / sim$n_i),
+    summarize_group_ess(res_global_post$ess_theta_cond_global / sim$n_i),
+    summarize_group_ess(res_global_prior_clip$ess_theta_cond_global / sim$n_i),
+    summarize_group_ess(res_global_post_clip$ess_theta_cond_global / sim$n_i)
+  ),
+  row.names = NULL
+)
+invisible(NULL)
+```
+
+`geoess_hier_global` computes local conditional ESS draw-by-draw and then
+averages under \(Q\). The underlying objects retained in this vignette include
+both signed ESS and clipped ESS (negative prior-curvature eigenvalues set to
+zero) for the same group-specific global conditional quantity
+\(\mathrm{ESS}^{glob}_{\theta_i\mid\phi}\), reported on both the
+per-observation and per-group scales, with Monte Carlo SE from finite draws.
+
+## Hierarchical ESS Summary
+
+Because hierarchical ESS is both level- and unit-specific, we report three
+distinct quantities:
+
+- the block ESS for the hyperparameters \(\phi=(\mu,\tau^2)\), measured in
+  group units;
+- the observation-specific conditional ESS for \(\theta_i \mid \phi\); and
+- the group-specific conditional ESS for \(\theta_i \mid \phi\), obtained by
+  scaling the observation-specific quantity by \(1/n_i\).
+
+The display tables below use the clipped ESS summaries, which match the
+nonnegative reporting convention used in the manuscript. The full signed
+objects remain available as `local_table`, `global_table`,
+`local_group_table`, and the corresponding global group tables.
+
+```{r hierarchical-ess-display}
+hier_main_summary_display <- data.frame(
+  Parameter = c(
+    "$\\phi = (\\mu, \\tau^2)$",
+    "obs-spec $\\theta_i \\mid \\phi$, average",
+    "grp-spec $\\theta_i \\mid \\phi$, average"
+  ),
+  `Local ESS<br>Prior mean` = c(
+    loc_prior$ess_phi_block_clip,
+    mean(loc_prior$ess_theta_cond_per_obs_clip),
+    mean(loc_prior$ess_theta_cond_per_group_clip)
+  ),
+  `Local ESS<br>Posterior mean` = c(
+    loc_post$ess_phi_block_clip,
+    mean(loc_post$ess_theta_cond_per_obs_clip),
+    mean(loc_post$ess_theta_cond_per_group_clip)
+  ),
+  `Global ESS<br>Prior average` = c(
+    res_global_prior_clip$ess_phi_global$estimate,
+    mean(res_global_prior_clip$ess_theta_cond_global),
+    mean(res_global_prior_clip$ess_theta_cond_global / sim$n_i)
+  ),
+  `Global ESS<br>Posterior average` = c(
+    res_global_post_clip$ess_phi_global$estimate,
+    mean(res_global_post_clip$ess_theta_cond_global),
+    mean(res_global_post_clip$ess_theta_cond_global / sim$n_i)
+  ),
+  check.names = FALSE
+)
+
+hier_main_summary_display[-1] <- lapply(hier_main_summary_display[-1], round, 1)
+
+knitr::kable(
+  hier_main_summary_display,
+  digits = 1,
+  escape = FALSE,
+  caption = paste(
+    "Hierarchical ESS summaries for the simulation.",
+    "This table reports clipped ESS for the hyperparameter block",
+    "$\\phi=(\\mu,\\tau^2)$, alongside the average observation-specific",
+    "and group-specific conditional ESS for $\\theta_i \\mid \\phi$."
+  )
+)
+
+hier_group_specific_display <- data.frame(
+  Group = seq_len(sim$K),
+  `$n_i$` = sim$n_i,
+  `$\\hat{\\sigma}_i^2$` = round(sim$sigma_hat2, 2),
+  `Local ESS<br>Prior mean<br>obs-spec` = round(loc_prior$ess_theta_cond_per_obs_clip, 1),
+  `Local ESS<br>Prior mean<br>grp-spec` = round(loc_prior$ess_theta_cond_per_group_clip, 1),
+  `Local ESS<br>Posterior mean<br>obs-spec` = round(loc_post$ess_theta_cond_per_obs_clip, 1),
+  `Local ESS<br>Posterior mean<br>grp-spec` = round(loc_post$ess_theta_cond_per_group_clip, 1),
+  `Global ESS<br>Prior average<br>obs-spec` = round(res_global_prior_clip$ess_theta_cond_global, 1),
+  `Global ESS<br>Prior average<br>grp-spec` = round(res_global_prior_clip$ess_theta_cond_global / sim$n_i, 1),
+  `Global ESS<br>Posterior average<br>obs-spec` = round(res_global_post_clip$ess_theta_cond_global, 1),
+  `Global ESS<br>Posterior average<br>grp-spec` = round(res_global_post_clip$ess_theta_cond_global / sim$n_i, 1),
+  check.names = FALSE
+)
+
+knitr::kable(
+  hier_group_specific_display,
+  digits = 1,
+  escape = FALSE,
+  caption = paste(
+    "Group-wise observation-specific and group-specific conditional ESS values.",
+    "Local ESS is evaluated at the prior and posterior means, while global ESS",
+    "is averaged over the prior and posterior distributions."
+  )
+)
+```
+
+The summary table highlights three consistent patterns. First, local and global
+ESS can diverge materially. For example, the average observation-specific
+conditional ESS drops from 18.9 at the prior mean to 9.5 at the posterior mean,
+but the corresponding global summaries are more stable at 12.5 under prior
+averaging and 10.9 under posterior averaging. Second, local conditional ESS is
+more sensitive to the reference point than global ESS is to the weighting
+distribution. Third, the hyperparameter block ESS is comparatively stable once
+averaged globally, with both prior- and posterior-averaged values near 12.1
+groups.
+
+The group-wise results make the same point more sharply. Groups 2 and 5 show an
+extreme divergence between local and global ESS, and that divergence comes
+entirely from the conditional prior curvature. For Group 2, the conditional
+curvature is very weak at the chosen reference point, so the local ESS is near
+zero, but it is much larger on average over the hierarchical uncertainty,
+yielding global group-specific ESS of 7.2 under prior averaging and 6.4 under
+posterior averaging. Group 5 shows the opposite pattern: the reference point
+falls in a region of unusually strong local curvature, producing large local
+ESS, but the broader prior and posterior averages are much smaller. Averaging
+therefore dampens unusually strong or weak local curvature and provides a more
+stable summary of borrowing.
+
+There is a common intuition that smaller groups borrow more information than
+larger groups. The global group-specific ESS broadly supports that intuition:
+smaller groups such as 2, 6, and 7 borrow substantially more than larger groups
+such as 1, 8, 9, and 10. At the same time, group size alone does not determine
+borrowing. Group 5 is small but borrows very little on the global scale,
+whereas Group 4 is only moderately sized but borrows heavily. Global
+conditional ESS therefore reflects group size, within-group variability, and
+the group's position in the hierarchical geometry, rather than sample size
+alone.
+
+```{r global-ess-plot-scatter}
+plot(
+  global_group_post_table$sigma_hat2,
+  global_group_post_table$ESS_global_post_per_obs,
+  pch = 19,
+  col = "firebrick",
+  xlab = expression(hat(sigma)[i]^2),
+  ylab = expression(ESS[theta[i] ~ "|" ~ phi]^glob ~ "(posterior, per observation)"),
+  main = expression("Posterior Global Per-Observation ESS vs " * hat(sigma)[i]^2)
+)
+text(
+  global_group_post_table$sigma_hat2,
+  global_group_post_table$ESS_global_post_per_obs,
+  labels = global_group_post_table$group,
+  pos = 3,
+  cex = 0.75
+)
+```
+
+```{r global-ess-plot-sorted}
+ord <- order(global_group_post_table$ESS_global_post_per_obs, decreasing = TRUE)
+rank_idx <- seq_len(sim$K)
+
+plot(
+  rank_idx,
+  global_group_post_table$ESS_global_post_per_obs[ord],
+  type = "b",
+  pch = 19,
+  col = "firebrick",
+  xaxt = "n",
+  xlab = "Group (sorted by posterior global ESS)",
+  ylab = expression(ESS[theta[i] ~ "|" ~ phi] ~ "(per observation)"),
+  main = "Group-specific ESS: posterior global vs local (posterior ref, per observation)"
+)
+axis(1, at = rank_idx, labels = global_group_post_table$group[ord])
+points(rank_idx, local_group_table$ESS_local_post_ref_per_obs[ord], pch = 17, col = "steelblue")
+legend(
+  "topright",
+  legend = c("Posterior global ESS (per observation)", "Local ESS at posterior reference (per observation)"),
+  col = c("firebrick", "steelblue"),
+  pch = c(19, 17),
+  bty = "n"
+)
+```
+
+## Sensitivity Analyses
+
+We vary three design dimensions:
+
+- number of groups: \(K \in \{5, 10, 20\}\),
+- true between-group variance: \(\tau_0^2 \in \{0.1^2, 0.5^2, 1^2\}\),
+- within-group sample size: \(n_i \in \{10, 30, 100\}\).
+
+```{r sensitivity-functions}
+fit_and_global_summary <- function(sim_obj, stan_model_hier,
+                                   m0, s0, a_tau, b_tau,
+                                   iter = 350, warmup = 175,
+                                   seed = 1) {
+  data_obj <- make_stan_data(sim_obj, m0, s0, a_tau, b_tau)
+
+  fit_obj <- rstan::sampling(
+    object = stan_model_hier,
+    data = data_obj,
+    chains = 1,
+    iter = iter,
+    warmup = warmup,
+    seed = seed,
+    refresh = 0,
+    control = list(adapt_delta = 0.9)
+  )
+
+  theta_draws_obj <- geoess_draws(fit_obj, pars = "theta", as = "matrix")
+  mu_draws_obj <- as.numeric(geoess_draws(fit_obj, pars = "mu", as = "matrix"))
+  tau2_draws_obj <- as.numeric(geoess_draws(fit_obj, pars = "tau2", as = "matrix"))
+
+  pars_theta_obj <- colnames(theta_draws_obj)
+  draws_obj <- cbind(theta_draws_obj, mu = mu_draws_obj, tau2 = tau2_draws_obj)
+
+  ipi_obj <- make_ipi_provider(sim_obj$K, m0, s0, a_tau, b_tau)
+  i1_obj <- make_i1_provider(sim_obj$K, sim_obj$sigma_hat2)
+
+  g_obj <- geoess_hier_global(
+    Q = "custom",
+    draws = draws_obj,
+    pars_theta = pars_theta_obj,
+    pars_phi = c("mu", "tau2"),
+    group_index = seq_len(sim_obj$K),
+    Ipi_provider = ipi_obj,
+    I1_provider = i1_obj,
+    return_by_group = TRUE
+  )
+
+  theta_group_per_obs <- g_obj$ess_theta_cond_global
+  theta_group_per_group <- theta_group_per_obs / sim_obj$n_i
+  data.frame(
+    global_ESS_phi_block_per_group = g_obj$ess_phi_global$estimate,
+    MCSE_phi_block_per_group = g_obj$ess_phi_global$mcse,
+    ess_theta_group_per_obs_mean = mean(theta_group_per_obs),
+    ess_theta_group_per_obs_median = median(theta_group_per_obs),
+    ess_theta_group_per_obs_q10 = as.numeric(stats::quantile(theta_group_per_obs, probs = 0.10)),
+    ess_theta_group_per_obs_q90 = as.numeric(stats::quantile(theta_group_per_obs, probs = 0.90)),
+    ess_theta_group_per_group_mean = mean(theta_group_per_group),
+    ess_theta_group_per_group_median = median(theta_group_per_group),
+    ess_theta_group_per_group_q10 = as.numeric(stats::quantile(theta_group_per_group, probs = 0.10)),
+    ess_theta_group_per_group_q90 = as.numeric(stats::quantile(theta_group_per_group, probs = 0.90))
+  )
+}
+```
+
+```{r sensitivity-K}
+K_grid <- c(5, 10, 20)
+
+sens_K <- do.call(rbind, lapply(seq_along(K_grid), function(i) {
+  K_i <- K_grid[i]
+  sim_i <- simulate_hier_data(
+    K = K_i,
+    n_i = rep(30, K_i),
+    mu0 = 0,
+    tau0 = 0.5,
+    seed = 20261000 + i
+  )
+  out_i <- fit_and_global_summary(
+    sim_obj = sim_i,
+    stan_model_hier = stan_model_hier,
+    m0 = m0,
+    s0 = s0,
+    a_tau = a_tau,
+    b_tau = b_tau,
+    iter = 320,
+    warmup = 160,
+    seed = 20262000 + i
+  )
+  cbind(data.frame(K = K_i), out_i)
+}))
+
+sens_K
+```
+
+```{r sensitivity-tau0}
+tau0_grid <- c(0.1, 0.5, 1.0)
+
+sens_tau <- do.call(rbind, lapply(seq_along(tau0_grid), function(i) {
+  tau0_i <- tau0_grid[i]
+  sim_i <- simulate_hier_data(
+    K = 10,
+    n_i = rep(30, 10),
+    mu0 = 0,
+    tau0 = tau0_i,
+    seed = 20263000 + i
+  )
+  out_i <- fit_and_global_summary(
+    sim_obj = sim_i,
+    stan_model_hier = stan_model_hier,
+    m0 = m0,
+    s0 = s0,
+    a_tau = a_tau,
+    b_tau = b_tau,
+    iter = 320,
+    warmup = 160,
+    seed = 20264000 + i
+  )
+  cbind(data.frame(tau0_sq = tau0_i^2), out_i)
+}))
+
+sens_tau
+```
+
+```{r sensitivity-ni}
+n_i_grid <- c(10, 30, 100)
+
+sens_n <- do.call(rbind, lapply(seq_along(n_i_grid), function(i) {
+  n_i_val <- n_i_grid[i]
+  sim_i <- simulate_hier_data(
+    K = 10,
+    n_i = rep(n_i_val, 10),
+    mu0 = 0,
+    tau0 = 0.5,
+    seed = 20265000 + i
+  )
+  out_i <- fit_and_global_summary(
+    sim_obj = sim_i,
+    stan_model_hier = stan_model_hier,
+    m0 = m0,
+    s0 = s0,
+    a_tau = a_tau,
+    b_tau = b_tau,
+    iter = 320,
+    warmup = 160,
+    seed = 20266000 + i
+  )
+  cbind(data.frame(n_i = n_i_val), out_i)
+}))
+
+sens_n
+```
+
+```{r sensitivity-plot}
+plot(
+  sens_tau$tau0_sq,
+  sens_tau$global_ESS_phi_block_per_group,
+  type = "b",
+  pch = 19,
+  col = "firebrick",
+  xlab = expression(tau[0]^2),
+  ylab = "Posterior global ESS for phi (per group)",
+  main = expression("Global Per-Group Block ESS vs " * tau[0]^2)
+)
+```
+
+```{r sensitivity-plot-theta}
+plot(
+  sens_tau$tau0_sq,
+  sens_tau$ess_theta_group_per_obs_median,
+  type = "b",
+  pch = 19,
+  col = "steelblue",
+  xlab = expression(tau[0]^2),
+  ylab = expression("Median across groups of " * ESS[theta[i] ~ "|" ~ phi]^glob ~ "(per observation)"),
+  main = expression("Distribution of Group Per-Observation ESS vs " * tau[0]^2)
+)
+segments(
+  x0 = sens_tau$tau0_sq,
+  y0 = sens_tau$ess_theta_group_per_obs_q10,
+  x1 = sens_tau$tau0_sq,
+  y1 = sens_tau$ess_theta_group_per_obs_q90,
+  col = "gray40",
+  lwd = 2
+)
+```
+
+## Practical Interpretation
+
+- `ESS_phi` is a block ESS for the hyperparameters in units of groups, so it
+  summarizes the strength of the shared borrowing structure itself.
+- `ESS_{theta_i|phi}^{(\mathrm{obs})}` measures how much borrowing group \(i\)
+  receives relative to one observation.
+- `ESS_{theta_i|phi}^{(\mathrm{grp})}` measures the same borrowing relative to
+  the full data block of group \(i\), which makes it the more natural scale for
+  comparing groups with different sample sizes.
+- The contrast between Groups 2 and 5 is a useful diagnostic: a very small
+  local ESS can coexist with a large global ESS, and vice versa, when the
+  chosen reference point is not representative of the broader hierarchical
+  geometry.
+- For reporting, the global conditional ESS is usually the more stable summary,
+  while the local conditional ESS is most useful as a pointwise diagnostic.
+
+At a high level, this is conceptually aligned with Morita et al. (2012): ESS in
+hierarchical models is level-specific and design-dependent. The geometric
+framework here emphasizes curvature-based local definitions plus explicit global
+averaging under a stated \(Q\).
+
+## Discussion
+
+This vignette shows end-to-end hierarchical ESS for information borrowing with:
+
+- local block ESS for \(\phi=(\mu,\tau^2)\) in units of groups,
+- local conditional ESS for each \(\theta_i\mid\phi\) in units of
+  observations and in units of groups,
+- global ESS under prior and posterior averaging on both scales.
+
+Using plug-in \(\widehat{\sigma}_i^2\) keeps the workflow simple while still
+capturing the main geometric features of hierarchical borrowing. The examples
+above show that borrowing strength is not a single universal number: it depends
+on the model level being summarized, the unit of comparison, the reference
+point, and the weighting distribution. The sensitivity analyses over \(K\),
+\(\tau_0^2\), and \(n_i\) reinforce the same message: hyperparameter ESS is
+relatively stable, whereas group-level conditional ESS can change materially
+with hierarchical design and heterogeneity.

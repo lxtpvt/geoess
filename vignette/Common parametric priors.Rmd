@@ -1,0 +1,984 @@
+---
+title: "Common parametric priors"
+output: html_vignette
+vignette: >
+  %\VignetteIndexEntry{Common parametric priors}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+set.seed(123)
+
+library(geoess)
+
+if (!requireNamespace("numDeriv", quietly = TRUE)) {
+  stop("numDeriv is required for this vignette")
+}
+if (!requireNamespace("Matrix", quietly = TRUE)) {
+  stop("Matrix is required for this vignette")
+}
+```
+
+## Theory recap
+
+Local ESS at a reference point $\theta^*$:
+
+$$
+ESS(\theta^*) = \frac{1}{d}\,\mathrm{tr}\{ I_1(\theta^*)^{-1} I_\pi(\theta^*) \}
+$$
+
+where $I_\pi(\theta) = -\nabla^2 \log \pi(\theta)$ and $I_1(\theta)$ is the Fisher
+information per observation for the likelihood.
+
+Global ESS under weighting distribution $Q$:
+
+$$
+ESS_Q = \mathbb{E}_{\theta \sim Q}[ ESS(\theta) ].
+$$
+
+Directional ESS for a vector $v$:
+
+$$
+ESS_{\mathrm{dir}}(v;\theta) = \frac{v^\top I_\pi(\theta)v}{v^\top I_1(\theta)v}.
+$$
+
+Local ESS depends on the reference point. Global ESS is a Monte Carlo expectation
+under $Q$. For mixture priors represented by fitted mixtures, `geoess_global()`
+uses weighted hard-assignment local ESS by default; full-mixture curvature can
+still be requested explicitly when needed.
+
+## Beta prior under canonical parameterization
+
+For a Bernoulli/Binomial likelihood with success probability $\theta$ and
+canonical parameter $\eta = \operatorname{logit}(\theta)$, the unit Fisher
+information is
+$$
+I_1(\eta) = \theta(\eta)\{1 - \theta(\eta)\}.
+$$
+If $\theta \sim \operatorname{Beta}(a,b)$, then on the $\eta$-scale the induced
+prior curvature is
+$$
+I_\pi(\eta) = (a+b)\theta(\eta)\{1 - \theta(\eta)\},
+$$
+so the local information ratio is constant:
+$$
+\frac{I_\pi(\eta)}{I_1(\eta)} = a+b.
+$$
+Accordingly, `geoess_beta_binomial_canonical(a, b)` returns the classical
+per-trial ESS $a+b$ on the canonical logit scale.
+
+```{r beta-canonical-demo}
+if (!isTRUE(exists("geoess_beta_binomial_canonical",
+                   envir = asNamespace("geoess"),
+                   mode = "function"))) {
+  stop("geoess_beta_binomial_canonical() not found. Please reinstall or reload the updated geoess package.")
+}
+geoess::geoess_beta_binomial_canonical(6, 6)
+```
+
+## Helper utilities
+
+```{r helpers}
+has_fun <- function(pkg, fn) {
+  isTRUE(requireNamespace(pkg, quietly = TRUE)) &&
+    exists(fn, envir = asNamespace(pkg), mode = "function")
+}
+
+if (!has_fun("geoess", "Ipi_beta")) {
+  stop("Ipi_beta() not found. Please reinstall or reload the updated geoess package.")
+}
+Ipi_beta <- geoess::Ipi_beta
+
+if (!has_fun("geoess", "geoess_beta_binomial_canonical")) {
+  stop("geoess_beta_binomial_canonical() not found. Please reinstall or reload the updated geoess package.")
+}
+geoess_beta_binomial_canonical <- geoess::geoess_beta_binomial_canonical
+
+as_matrix_scalar <- function(x) {
+  if (is.numeric(x) && length(x) == 1L) {
+    return(matrix(as.numeric(x), nrow = 1, ncol = 1))
+  }
+  x
+}
+
+ess_trace <- function(I1, Ipi) {
+  I1 <- as_matrix_scalar(I1)
+  Ipi <- as_matrix_scalar(Ipi)
+  if (has_fun("geoess", "geoess_trace")) {
+    out <- tryCatch(geoess_trace(I1, Ipi), error = function(e) NULL)
+    if (!is.null(out)) return(out)
+  }
+  I1 <- as.matrix(I1); Ipi <- as.matrix(Ipi)
+  d <- nrow(I1)
+  sum(diag(solve(I1, Ipi))) / d
+}
+
+global_trace <- function(Q, I1, Ipi, weights = NULL, psd = "none") {
+  I1 <- as_matrix_scalar(I1)
+  Ipi <- as_matrix_scalar(Ipi)
+  if (has_fun("geoess", "geoess_global")) {
+    out <- tryCatch(
+      geoess_global(
+        Q = Q, I1 = I1, Ipi = Ipi, method = "trace",
+        weights = weights, psd = psd, mixture_attribution = "hard_resp"
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(out)) return(as.numeric(out$estimate))
+  }
+  draws <- as.matrix(Q)
+  n <- nrow(draws)
+  if (is.null(weights)) weights <- rep(1 / n, n)
+  weights <- weights / sum(weights)
+  vals <- numeric(n)
+  for (i in seq_len(n)) {
+    I1_i <- if (is.function(I1)) I1(draws[i, ]) else I1
+    Ipi_i <- if (is.function(Ipi)) Ipi(draws[i, ]) else Ipi
+    vals[i] <- ess_trace(I1_i, Ipi_i)
+  }
+  sum(weights * vals)
+}
+
+global_trace_prior <- function(Q, I1, Ipi, psd = "none") {
+  I1 <- as_matrix_scalar(I1)
+  Ipi <- as_matrix_scalar(Ipi)
+  if (has_fun("geoess", "geoess_global_prior")) {
+    out <- tryCatch(
+      geoess_global_prior(Q, I1 = I1, Ipi = Ipi, method = "trace", psd = psd),
+      error = function(e) NULL
+    )
+    if (!is.null(out)) return(as.numeric(out$estimate))
+  }
+  global_trace(Q, I1, Ipi, psd = psd)
+}
+
+logsumexp <- function(x) {
+  m <- max(x)
+  m + log(sum(exp(x - m)))
+}
+
+weights_from_loglik <- function(loglik_vals) {
+  w <- exp(loglik_vals - logsumexp(loglik_vals))
+  w / sum(w)
+}
+
+Ipi_num <- function(logprior, theta) {
+  H <- -numDeriv::hessian(logprior, theta)
+  0.5 * (H + t(H))
+}
+
+rlaplace <- function(n, mu = 0, b = 1) {
+  u <- runif(n, -0.5, 0.5)
+  mu - b * sign(u) * log(1 - 2 * abs(u))
+}
+
+rhalfnorm <- function(n, sd = 1) abs(rnorm(n, mean = 0, sd = sd))
+
+beta_target_p <- function(a, b, target = a + b) {
+  A <- a - 1
+  B <- b - 1
+  disc <- target^2 - 4 * A * B
+  if (disc < 0) return(NA_real_)
+  t1 <- (target + sqrt(disc)) / (2 * B)
+  t2 <- (target - sqrt(disc)) / (2 * B)
+  p1 <- t1 / (1 + t1)
+  p2 <- t2 / (1 + t2)
+  p_mean <- a / (a + b)
+  if (abs(p1 - p_mean) <= abs(p2 - p_mean)) p1 else p2
+}
+
+I1_bern <- function(p) 1 / (p * (1 - p))
+
+rbest_mixfit_best <- function(draws, type, Nc_grid = 1:2, aic_k = 2) {
+  if (!requireNamespace("RBesT", quietly = TRUE)) return(NULL)
+  if (!isTRUE(exists("mixfit", envir = asNamespace("RBesT"), mode = "function"))) {
+    return(NULL)
+  }
+  draws <- as.numeric(draws)
+  draws <- draws[is.finite(draws)]
+  if (length(draws) < 5L) return(NULL)
+  f <- get("mixfit", envir = asNamespace("RBesT"))
+  fits <- lapply(Nc_grid, function(nc) {
+    args <- list(sample = draws, type = type, Nc = nc, verbose = FALSE)
+    tryCatch(do.call(f, args), error = function(e) NULL)
+  })
+  aic <- vapply(
+    fits,
+    function(fit) if (is.null(fit)) Inf else AIC(fit, k = aic_k),
+    numeric(1)
+  )
+  if (!any(is.finite(aic))) return(NULL)
+  fits[[which.min(aic)]]
+}
+
+rbest_ess_from_mix <- function(mix, type, sigma = NULL, likelihood = NULL) {
+  if (is.null(mix)) return(c(elir = NA_real_, moment = NA_real_, morita = NA_real_))
+  if (type == "gamma" && !is.null(likelihood)) {
+    set_like <- get("likelihood<-", envir = asNamespace("RBesT"))
+    mix <- set_like(mix, likelihood)
+  }
+  if (type == "norm") {
+    if (is.null(sigma) || !is.finite(sigma) || sigma <= 0) {
+      return(c(elir = NA_real_, moment = NA_real_, morita = NA_real_))
+    }
+  }
+  vapply(
+    c("elir", "moment", "morita"),
+    function(m) {
+      tryCatch(
+        if (type == "norm") RBesT::ess(mix, method = m, sigma = sigma)
+        else RBesT::ess(mix, method = m),
+        error = function(e) NA_real_
+      )
+    },
+    numeric(1)
+  )
+}
+
+rbest_ess_from_draws <- function(draws, type, sigma = NULL, likelihood = NULL,
+                                 Nc_grid = 1:2, aic_k = 2) {
+  if (!requireNamespace("RBesT", quietly = TRUE)) {
+    return(c(elir = NA_real_, moment = NA_real_, morita = NA_real_))
+  }
+  if (is.matrix(draws) && ncol(draws) > 1L) {
+    mixes <- lapply(seq_len(ncol(draws)), function(j) {
+      rbest_mixfit_best(draws[, j], type = type, Nc_grid = Nc_grid, aic_k = aic_k)
+    })
+    vals <- lapply(mixes, rbest_ess_from_mix, type = type, sigma = sigma, likelihood = likelihood)
+    mat <- do.call(rbind, vals)
+    out <- colMeans(mat, na.rm = TRUE)
+    if (any(!is.finite(out))) {
+      out <- c(elir = NA_real_, moment = NA_real_, morita = NA_real_)
+    }
+    attr(out, "mixes") <- mixes
+    return(out)
+  }
+  mix <- rbest_mixfit_best(draws, type = type, Nc_grid = Nc_grid, aic_k = aic_k)
+  out <- rbest_ess_from_mix(mix, type = type, sigma = sigma, likelihood = likelihood)
+  attr(out, "mix") <- mix
+  out
+}
+
+bayesess_ess <- function(model, prior, ...) {
+  if (!requireNamespace("BayesESS", quietly = TRUE)) return(NA_real_)
+  val <- NA_real_
+  capture.output({
+    val <- tryCatch(
+      BayesESS::ess(model = model, prior = prior, ...),
+      error = function(e) NA_real_
+    )
+  })
+  val <- suppressWarnings(as.numeric(val))
+  if (length(val) < 1L || !is.finite(val[1])) return(NA_real_)
+  val[1]
+}
+
+geoess_mixfit_from_draws <- function(draws, mix_family = c("auto", "norm", "mvnorm", "beta"),
+                                     K_grid = 1:2, criterion = "BIC") {
+  mix_family <- match.arg(mix_family)
+  if (mix_family == "beta") {
+    if (!has_fun("geoess", "geoess_automixfit_beta")) return(NULL)
+    x <- as.numeric(draws)
+    x <- x[is.finite(x)]
+    if (length(x) < 5L) return(NULL)
+    return(tryCatch(
+      geoess_automixfit_beta(x, K_grid = K_grid, criterion = criterion),
+      error = function(e) NULL
+    ))
+  }
+  if (!has_fun("geoess", "geoess_automixfit")) return(NULL)
+  if (!requireNamespace("mvtnorm", quietly = TRUE)) return(NULL)
+  X <- as.matrix(draws)
+  fam <- if (mix_family == "auto") {
+    if (ncol(X) > 1L) "mvnorm" else "norm"
+  } else {
+    mix_family
+  }
+  tryCatch(
+    geoess_automixfit(X, family = fam, K_grid = K_grid, criterion = criterion),
+    error = function(e) NULL
+  )
+}
+
+geoess_Ipi_from_mix_any <- function(mix, theta, psd = "none") {
+  if (is.null(mix)) return(NULL)
+  if (inherits(mix, "geoess_mix")) {
+    return(geoess_Ipi_from_mix(mix, theta, psd = psd))
+  }
+  if (inherits(mix, "betaMix")) {
+    theta <- as.numeric(theta)
+    eps <- 1e-6
+    theta <- pmin(pmax(theta, eps), 1 - eps)
+    w <- mix["w", ]
+    a <- mix["a", ]
+    b <- mix["b", ]
+    log_comp <- log(w) + dbeta(theta, a, b, log = TRUE)
+    m <- max(log_comp)
+    resp <- exp(log_comp - (m + log(sum(exp(log_comp - m)))))
+    gk <- (a - 1) / theta - (b - 1) / (1 - theta)
+    Hk <- - (a - 1) / theta^2 - (b - 1) / (1 - theta)^2
+    g <- sum(resp * gk)
+    H <- sum(resp * (Hk + gk^2)) - g^2
+    Ipi <- matrix(-H, nrow = 1, ncol = 1)
+    if (psd != "none" && Ipi[1, 1] < 0) Ipi[1, 1] <- 0
+    return(Ipi)
+  }
+  NULL
+}
+
+geoess_from_samples_mix <- function(draws, I1, theta_ref, mix_family = "auto",
+                                    psd = "clip", K_grid = 1:2,
+                                    criterion = "BIC") {
+  mix <- geoess_mixfit_from_draws(
+    draws,
+    mix_family = mix_family,
+    K_grid = K_grid,
+    criterion = criterion
+  )
+  if (is.null(mix)) return(c(local = NA_real_, prior = NA_real_))
+  Ipi_fun <- function(th) geoess_Ipi_from_mix_any(mix, th, psd = psd)
+  Ipi_ref <- Ipi_fun(theta_ref)
+  if (is.null(Ipi_ref)) return(c(local = NA_real_, prior = NA_real_))
+  I1_ref <- if (is.function(I1)) I1(theta_ref) else I1
+  ess_local <- tryCatch(ess_trace(I1_ref, Ipi_ref), error = function(e) NA_real_)
+  draws_mat <- if (is.matrix(draws)) draws else matrix(draws, ncol = 1)
+  ess_prior <- tryCatch(
+    global_trace_prior(draws_mat, I1, Ipi_fun, psd = psd),
+    error = function(e) NA_real_
+  )
+  c(local = ess_local, prior = ess_prior)
+}
+
+geoess_from_samples_mix_log <- function(draws, I1, theta_ref, psd = "clip",
+                                        K_grid = 1:2, criterion = "BIC",
+                                        eps = 1e-8) {
+  if (!has_fun("geoess", ".geoess_samples_mix_log")) {
+    return(c(local = NA_real_, prior = NA_real_))
+  }
+  geoess:::.geoess_samples_mix_log(
+    draws = draws,
+    I1 = I1,
+    theta_ref = theta_ref,
+    psd = psd,
+    K_grid = K_grid,
+    criterion = criterion,
+    eps = eps
+  )
+}
+
+geoess_Ipi_from_beta_mix_logit <- function(mix, eta, psd = "none", eps = 1e-8) {
+  if (is.null(mix) || !inherits(mix, "betaMix")) return(NULL)
+  if (!is.numeric(eps) || length(eps) != 1L || eps <= 0) return(NULL)
+
+  theta <- plogis(as.numeric(eta))
+  if (length(theta) != 1L || !is.finite(theta)) return(NULL)
+  theta <- pmin(pmax(theta, eps), 1 - eps)
+
+  w <- mix["w", ]
+  a <- mix["a", ]
+  b <- mix["b", ]
+
+  log_comp <- log(w) + dbeta(theta, a, b, log = TRUE)
+  m <- max(log_comp)
+  resp <- exp(log_comp - (m + log(sum(exp(log_comp - m)))))
+
+  gk <- (a - 1) / theta - (b - 1) / (1 - theta)
+  Hk <- - (a - 1) / theta^2 - (b - 1) / (1 - theta)^2
+
+  g_theta <- sum(resp * gk)
+  H_theta <- sum(resp * (Hk + gk^2)) - g_theta^2
+
+  A <- theta * (1 - theta)
+  H_eta <- A^2 * H_theta + A * (1 - 2 * theta) * g_theta - 2 * A
+  Ipi_eta <- -H_eta
+
+  if (!is.finite(Ipi_eta)) return(NULL)
+  if (psd != "none" && Ipi_eta < 0) Ipi_eta <- 0
+  matrix(Ipi_eta, nrow = 1L, ncol = 1L)
+}
+
+geoess_from_samples_beta_canonical <- function(draws, theta_ref, psd = "clip",
+                                               K_grid = 1:2, criterion = "BIC",
+                                               eps = 1e-8) {
+  if (!has_fun("geoess", "geoess_automixfit_beta")) {
+    return(c(local = NA_real_, prior = NA_real_))
+  }
+
+  x <- as.numeric(draws)
+  x <- x[is.finite(x)]
+  x <- pmin(pmax(x, eps), 1 - eps)
+  if (length(x) < 5L) return(c(local = NA_real_, prior = NA_real_))
+
+  mix <- tryCatch(
+    geoess_automixfit_beta(x, K_grid = K_grid, criterion = criterion),
+    error = function(e) NULL
+  )
+  if (is.null(mix)) return(c(local = NA_real_, prior = NA_real_))
+
+  eta_ref <- qlogis(pmin(pmax(theta_ref, eps), 1 - eps))
+  eta_draws <- qlogis(x)
+  I1_eta <- function(eta) {
+    th <- geoess_logistic(eta)
+    matrix(th * (1 - th), nrow = 1L, ncol = 1L)
+  }
+  Ipi_eta <- function(eta) geoess_Ipi_from_beta_mix_logit(mix, eta, psd = psd, eps = eps)
+
+  Ipi_ref <- Ipi_eta(eta_ref)
+  if (is.null(Ipi_ref)) return(c(local = NA_real_, prior = NA_real_))
+
+  ess_local <- tryCatch(
+    geoess_trace(I1_eta(eta_ref), Ipi_ref),
+    error = function(e) NA_real_
+  )
+  ess_prior <- tryCatch(
+    global_trace_prior(matrix(eta_draws, ncol = 1L), I1_eta, Ipi_eta, psd = psd),
+    error = function(e) NA_real_
+  )
+
+  c(local = ess_local, prior = ess_prior)
+}
+```
+
+## Common Priors: Prior-only
+
+We evaluate the geometric ESS framework across a diverse suite of common
+parametric priors, and compare the resulting summaries with the Morita, moment,
+and ELIR methodologies from `RBesT`, together with the `BayesESS` implementation
+of Morita ESS when available. In addition to exact analytic calculations for
+several common priors, `geoess` also provides sample-based approximations from
+numerical draws, which we report alongside the analytic benchmarks.
+
+```{r prior-only}
+results_prior <- data.frame(
+  prior = character(),
+  theta_ref = character(),
+  ESS_local = numeric(),
+  ESS_prior_avg = numeric(),
+  ESS_local_samples_geoess = numeric(),
+  ESS_prior_avg_samples_geoess = numeric(),
+  ESS_bayesess = numeric(),
+  ESS_elir = numeric(),
+  ESS_moment = numeric(),
+  ESS_morita = numeric(),
+  stringsAsFactors = FALSE
+)
+
+add_row <- function(prior, theta_ref, ess_local, ess_prior,
+                    ess_local_samples_geoess = NA_real_, ess_prior_avg_samples_geoess = NA_real_,
+                    ess_bayesess = NA_real_,
+                    ess_elir = NA_real_, ess_moment = NA_real_, ess_morita = NA_real_) {
+  results_prior <<- rbind(
+    results_prior,
+    data.frame(prior = prior, theta_ref = theta_ref,
+               ESS_local = ess_local, ESS_prior_avg = ess_prior,
+               ESS_local_samples_geoess = ess_local_samples_geoess,
+               ESS_prior_avg_samples_geoess = ess_prior_avg_samples_geoess,
+               ESS_bayesess = ess_bayesess,
+               ESS_elir = ess_elir, ESS_moment = ess_moment, ESS_morita = ess_morita,
+               stringsAsFactors = FALSE)
+  )
+}
+
+## Normal prior on mean mu, Normal likelihood (sigma known)
+sigma <- sqrt(10)
+m0 <- 0
+s0 <- 1
+I1_norm <- 1 / sigma^2
+Ipi_norm <- 1 / s0^2
+theta_ref <- m0
+set.seed(20260301)
+draws <- rnorm(1000, mean = m0, sd = s0)
+rbest_vals <- rbest_ess_from_draws(draws, type = "norm", sigma = sigma)
+n0_norm <- max(1L, as.integer(round(sigma^2 / s0^2)))
+bayesess_norm <- bayesess_ess("normNorm", prior = c(m0, sigma^2, n0_norm))
+geoess_samples <- geoess_from_samples_mix(draws, I1_norm, theta_ref, mix_family = "norm")
+add_row("Normal(mu)", "prior_mean",
+        ess_trace(I1_norm, Ipi_norm),
+        global_trace_prior(matrix(draws, ncol = 1), I1_norm, Ipi_norm),
+        ess_local_samples_geoess = geoess_samples["local"],
+        ess_prior_avg_samples_geoess = geoess_samples["prior"],
+        ess_bayesess = bayesess_norm,
+        ess_elir = rbest_vals["elir"],
+        ess_moment = rbest_vals["moment"],
+        ess_morita = rbest_vals["morita"])
+
+## MVN prior on beta, Normal likelihood (linear regression)
+if (requireNamespace("mvtnorm", quietly = TRUE)) {
+  set.seed(20260302)
+  X <- matrix(rnorm(50 * 2), ncol = 2)
+  beta0 <- c(0, 0)
+  Sigma0 <- diag(c(1, 2))
+  I1_mvn <- (1 / sigma^2) * crossprod(X) / nrow(X)
+  Ipi_mvn <- solve(Sigma0)
+  draws_mvn <- mvtnorm::rmvnorm(500, mean = beta0, sigma = Sigma0)
+  rbest_vals <- rbest_ess_from_draws(draws_mvn, type = "norm", sigma = sigma)
+  bayesess_mvn <- NA_real_
+  geoess_samples <- geoess_from_samples_mix(draws_mvn, I1_mvn, beta0, mix_family = "mvnorm")
+  add_row("MVN(mu0,mu1)", "prior_mean",
+          ess_trace(I1_mvn, Ipi_mvn),
+          global_trace_prior(draws_mvn, I1_mvn, Ipi_mvn),
+          ess_local_samples_geoess = geoess_samples["local"],
+          ess_prior_avg_samples_geoess = geoess_samples["prior"],
+          ess_bayesess = bayesess_mvn,
+          ess_elir = rbest_vals["elir"],
+          ess_moment = rbest_vals["moment"],
+          ess_morita = rbest_vals["morita"])
+}
+
+## Student-t prior (df=5) on mean, Normal likelihood
+df_t <- 5
+scale_t <- 1.1
+logprior_t <- function(theta) dt(theta / scale_t, df = df_t, log = TRUE) - log(scale_t)
+theta_ref <- 0
+Ipi_t <- Ipi_num(logprior_t, theta_ref)
+set.seed(20260303)
+draws_t <- scale_t * rt(1000, df = df_t)
+rbest_vals <- rbest_ess_from_draws(draws_t, type = "norm", sigma = sigma)
+bayesess_t <- NA_real_
+geoess_samples <- geoess_from_samples_mix(draws_t, I1_norm, theta_ref, mix_family = "norm")
+add_row("Student-t(mu)", "prior_mean",
+        ess_trace(I1_norm, Ipi_t),
+        global_trace_prior(matrix(draws_t, ncol = 1), I1_norm,
+                           function(th) Ipi_num(logprior_t, th)),
+        ess_local_samples_geoess = geoess_samples["local"],
+        ess_prior_avg_samples_geoess = geoess_samples["prior"],
+        ess_bayesess = bayesess_t,
+        ess_elir = rbest_vals["elir"],
+        ess_moment = rbest_vals["moment"],
+        ess_morita = rbest_vals["morita"])
+
+## Laplace prior on mean (use a smooth absolute value for curvature)
+mu_lap <- 0
+b_lap <- 1
+eps_lap <- 1
+logprior_lap <- function(theta) {
+  -sqrt((theta - mu_lap)^2 + eps_lap^2) / b_lap - log(2 * b_lap)
+}
+theta_ref <- mu_lap
+Ipi_lap <- Ipi_num(logprior_lap, theta_ref)
+set.seed(20260304)
+draws_lap <- rlaplace(1000, mu = mu_lap, b = b_lap)
+rbest_vals <- rbest_ess_from_draws(draws_lap, type = "norm", sigma = sigma)
+bayesess_lap <- NA_real_
+geoess_samples <- geoess_from_samples_mix(draws_lap, I1_norm, theta_ref, mix_family = "norm")
+add_row("Laplace(mu)", "prior_mean",
+        ess_trace(I1_norm, Ipi_lap),
+        global_trace_prior(matrix(draws_lap, ncol = 1), I1_norm,
+                           function(th) Ipi_num(logprior_lap, th)),
+        ess_local_samples_geoess = geoess_samples["local"],
+        ess_prior_avg_samples_geoess = geoess_samples["prior"],
+        ess_bayesess = bayesess_lap,
+        ess_elir = rbest_vals["elir"],
+        ess_moment = rbest_vals["moment"],
+        ess_morita = rbest_vals["morita"])
+
+## Half-Normal prior on positive theta, Normal likelihood (sigma known)
+sd_hn <- 1
+logprior_hn <- function(theta) {
+  if (theta < 0) return(-Inf)
+  log(sqrt(2 / pi) / sd_hn) - 0.5 * (theta / sd_hn)^2
+}
+I1_exp <- function(theta) 1 / (theta^2)
+theta_ref <- sd_hn * sqrt(2 / pi)
+Ipi_hn <- Ipi_num(logprior_hn, theta_ref)
+set.seed(20260305)
+draws_hn <- rhalfnorm(1000, sd = sd_hn)
+rbest_vals <- rbest_ess_from_draws(draws_hn, type = "norm", sigma = sigma)
+bayesess_hn <- NA_real_
+sd_hat_hn <- sqrt(mean(draws_hn^2))
+Ipi_hn_hat <- matrix(1 / sd_hat_hn^2, nrow = 1, ncol = 1)
+geoess_samples <- c(
+  local = ess_trace(I1_norm, Ipi_hn_hat),
+  prior = global_trace_prior(matrix(draws_hn, ncol = 1), I1_norm, Ipi_hn_hat)
+)
+add_row("Half-Normal(theta)", "prior_mean",
+        ess_trace(I1_norm, Ipi_hn),
+        global_trace_prior(matrix(draws_hn, ncol = 1), I1_norm,
+                           function(th) Ipi_num(logprior_hn, th)),
+        ess_local_samples_geoess = geoess_samples["local"],
+        ess_prior_avg_samples_geoess = geoess_samples["prior"],
+        ess_bayesess = bayesess_hn,
+        ess_elir = rbest_vals["elir"],
+        ess_moment = rbest_vals["moment"],
+        ess_morita = rbest_vals["morita"])
+
+## Lognormal prior on positive theta, Exponential likelihood
+meanlog <- 0
+sdlog <- 0.3
+logprior_lnorm <- function(theta) dlnorm(theta, meanlog = meanlog, sdlog = sdlog, log = TRUE)
+theta_ref <- exp(meanlog + 0.5 * sdlog^2)
+Ipi_lnorm <- Ipi_num(logprior_lnorm, theta_ref)
+set.seed(20260306)
+draws_lnorm <- rlnorm(1000, meanlog = meanlog, sdlog = sdlog)
+rbest_vals <- rbest_ess_from_draws(draws_lnorm, type = "gamma", likelihood = "exp")
+bayesess_lnorm <- NA_real_
+geoess_samples <- geoess_from_samples_mix_log(draws_lnorm, I1_exp, theta_ref)
+add_row("Lognormal(theta)", "prior_mean",
+        ess_trace(I1_exp(theta_ref), Ipi_lnorm),
+        global_trace_prior(matrix(draws_lnorm, ncol = 1), I1_exp,
+                           function(th) Ipi_num(logprior_lnorm, th)),
+        ess_local_samples_geoess = geoess_samples["local"],
+        ess_prior_avg_samples_geoess = geoess_samples["prior"],
+        ess_bayesess = bayesess_lnorm,
+        ess_elir = rbest_vals["elir"],
+        ess_moment = rbest_vals["moment"],
+        ess_morita = rbest_vals["morita"])
+
+## Gamma prior on Poisson rate
+a_g <- 6
+b_g <- 12
+logprior_g <- function(theta) dgamma(theta, shape = a_g, rate = b_g, log = TRUE)
+I1_pois <- function(theta) 1 / theta
+theta_ref <- (a_g-1) / b_g
+Ipi_g <- Ipi_num(logprior_g, theta_ref)
+set.seed(20260307)
+draws_g <- rgamma(1000, shape = a_g, rate = b_g)
+rbest_vals <- rbest_ess_from_draws(draws_g, type = "gamma", likelihood = "poisson")
+bayesess_g <- bayesess_ess("gammaPois", prior = c(0, a_g, b_g))
+geoess_samples <- geoess_from_samples_mix(draws_g, I1_pois, theta_ref, mix_family = "norm")
+add_row("Gamma(lambda)", "prior_mode",
+        ess_trace(I1_pois(theta_ref), Ipi_g),
+        global_trace_prior(matrix(draws_g, ncol = 1), I1_pois,
+                           function(th) Ipi_num(logprior_g, th)),
+        ess_local_samples_geoess = geoess_samples["local"],
+        ess_prior_avg_samples_geoess = geoess_samples["prior"],
+        ess_bayesess = bayesess_g,
+        ess_elir = rbest_vals["elir"],
+        ess_moment = rbest_vals["moment"],
+        ess_morita = rbest_vals["morita"])
+
+## Inverse-Gamma prior on variance sigma2, Normal likelihood
+a_ig <- 4
+b_ig <- 3
+logprior_ig <- function(theta) {
+  if (theta <= 0) return(-Inf)
+  a_ig * log(b_ig) - lgamma(a_ig) - (a_ig + 1) * log(theta) - b_ig / theta
+}
+I1_var <- function(theta) 0.5 / (theta^2)
+theta_ref <- b_ig / (a_ig + 1)
+Ipi_ig <- Ipi_num(logprior_ig, theta_ref)
+set.seed(20260308)
+draws_ig <- 1 / rgamma(1000, shape = a_ig, rate = b_ig)
+# RBesT gammaMix proxy on precision scale (1/sigma2) for comparison.
+rbest_vals <- rbest_ess_from_draws(1 / draws_ig, type = "gamma", likelihood = "exp")
+bayesess_ig <- bayesess_ess("invGammaNorm", prior = c(a_ig, b_ig))
+geoess_samples <- geoess_from_samples_mix(draws_ig, I1_var, theta_ref, mix_family = "norm")
+add_row("Inv-Gamma(sigma2)", "prior_mode",
+        ess_trace(I1_var(theta_ref), Ipi_ig),
+        global_trace_prior(matrix(draws_ig, ncol = 1), I1_var,
+                           function(th) Ipi_num(logprior_ig, th)),
+        ess_local_samples_geoess = geoess_samples["local"],
+        ess_prior_avg_samples_geoess = geoess_samples["prior"],
+        ess_bayesess = bayesess_ig,
+        ess_elir = rbest_vals["elir"],
+        ess_moment = rbest_vals["moment"],
+        ess_morita = rbest_vals["morita"])
+
+## Beta prior on Bernoulli p
+a_b <- 5
+b_b <- 5
+logprior_b <- function(theta) dbeta(theta, a_b, b_b, log = TRUE)
+theta_ref <- a_b / (a_b + b_b)
+set.seed(20260310)
+draws_b <- rbeta(1000, a_b, b_b)
+rbest_vals <- rbest_ess_from_draws(draws_b, type = "beta")
+bayesess_b <- bayesess_ess("betaBin", prior = c(0, a_b, b_b))
+beta_canonical <- geoess_beta_binomial_canonical(a_b, b_b, return = "details")
+geoess_samples <- geoess_from_samples_beta_canonical(
+  draws_b,
+  theta_ref = theta_ref,
+  K_grid = 1:3,
+  criterion = "BIC"
+)
+add_row("Beta(p)", "prior_mean",
+        beta_canonical$ess_local,
+        beta_canonical$ess_global,
+        ess_local_samples_geoess = geoess_samples["local"],
+        ess_prior_avg_samples_geoess = geoess_samples["prior"],
+        ess_bayesess = bayesess_b,
+        ess_elir = rbest_vals["elir"],
+        ess_moment = rbest_vals["moment"],
+        ess_morita = rbest_vals["morita"])
+
+invisible(results_prior)
+## Design-based global ESS example (Normal prior, wider design Q)
+set.seed(20260309)
+design_draws <- rnorm(1000, mean = m0, sd = 2 * s0)
+design_result <- data.frame(
+  prior = "Normal(mu)",
+  Q = "design: N(m0, (2*s0)^2)",
+  ESS_design = global_trace(matrix(design_draws, ncol = 1), I1_norm, Ipi_norm)
+)
+invisible(design_result)
+
+```
+
+```{r prior-only-display}
+prior_labels <- results_prior$prior
+prior_labels[prior_labels == "Beta(p)"] <- "Beta(p), a=b=5"
+
+common_priors_baseline_display <- data.frame(
+  Prior = prior_labels,
+  `Ref. point` = results_prior$theta_ref,
+  `Local ESS<br>geoess<br>Analytic` = round(results_prior$ESS_local, 1),
+  `Local ESS<br>geoess<br>Samples` = round(results_prior$ESS_local_samples_geoess, 1),
+  `Local ESS<br>Morita<br>BayesESS` = round(results_prior$ESS_bayesess, 1),
+  `Local ESS<br>Morita<br>RBesT` = round(results_prior$ESS_morita, 1),
+  `Local ESS<br>Moment<br>RBesT` = round(results_prior$ESS_moment, 1),
+  `Global ESS<br>geoess<br>Analytic` = round(results_prior$ESS_prior_avg, 1),
+  `Global ESS<br>geoess<br>Samples` = round(results_prior$ESS_prior_avg_samples_geoess, 1),
+  `Global ESS<br>ELIR<br>RBesT` = round(results_prior$ESS_elir, 1),
+  check.names = FALSE
+)
+
+knitr::kable(
+  common_priors_baseline_display,
+  escape = FALSE,
+  caption = "ESS comparisons for common parametric priors."
+)
+```
+
+Simulation results are summarized in the table above. Since `RBesT` does not
+support analytic ESS calculation for several of these priors, we use its
+sample-based functions to evaluate Morita, moment, and ELIR ESS. `BayesESS`
+provides analytic ESS only for a subset of the listed priors and no sample-based
+approximations. Several clear patterns emerge:
+
+- For regular conjugate priors such as Normal, MVN, Gamma, and Beta, the
+  analytic `geoess` values recover the expected ESS benchmarks, and the
+  sample-based `geoess` approximations stay close to the analytic targets.
+- For priors with nonuniform curvature, such as Student-$t$, Laplace, and
+  Inverse-Gamma, local ESS near the mode or prior mean can remain close to 10
+  while the prior-averaged global ESS drops noticeably. These priors are
+  locally informative but globally less constraining.
+- For the Half-Normal prior, `geoess` remains stable near 10, while `RBesT`
+  produces very large Morita, moment, and ELIR values. This makes the
+  truncation sensitivity of matching-based methods easy to see in a simple
+  example.
+
+## Posterior-updated ESS
+
+When observed data \(y\) are incorporated, the relevant estimation region shifts
+from prior-supported regions to posterior-supported ones. We therefore report a
+local ESS at the posterior reference point together with both prior-averaged and
+posterior-averaged global ESS.
+
+```{r with-data}
+n_y <- 10
+
+results_post <- data.frame(
+  prior = character(),
+  y = character(),
+  theta_ref = character(),
+  ESS_local = numeric(),
+  ESS_prior_avg = numeric(),
+  ESS_post_avg = numeric(),
+  stringsAsFactors = FALSE
+)
+
+add_row_post <- function(prior, y, theta_ref, ess_local, ess_prior, ess_post) {
+  results_post <<- rbind(
+    results_post,
+    data.frame(prior = prior, y = y, theta_ref = theta_ref,
+               ESS_local = ess_local,
+               ESS_prior_avg = ess_prior,
+               ESS_post_avg = ess_post,
+               stringsAsFactors = FALSE)
+  )
+}
+
+## Common Normal-likelihood data for mean parameter
+sigma <- sqrt(10)
+set.seed(20260401)
+y_norm <- rnorm(n_y, mean = 0.5, sd = sigma)
+loglik_norm <- function(theta) sum(dnorm(y_norm, mean = theta, sd = sigma, log = TRUE))
+loglik_vals <- function(draws) vapply(draws, loglik_norm, numeric(1))
+
+## Normal prior -> conjugate posterior
+m0 <- 0
+s0 <- 1
+post_var <- 1 / (length(y_norm) / sigma^2 + 1 / s0^2)
+post_mean <- post_var * (length(y_norm) * mean(y_norm) / sigma^2 + m0 / s0^2)
+set.seed(20260402)
+post_draws <- rnorm(1000, mean = post_mean, sd = sqrt(post_var))
+theta_ref <- post_mean
+Ipi_norm <- 1 / s0^2
+set.seed(20260403)
+ess_prior <- global_trace(matrix(rnorm(1000, mean = m0, sd = s0), ncol = 1),
+                          1 / sigma^2, Ipi_norm)
+add_row_post("Normal(mu)", "$\\mathcal{N}(0.5, 10)$", "posterior_mean",
+             ess_trace(1 / sigma^2, Ipi_norm),
+             ess_prior,
+             global_trace(matrix(post_draws, ncol = 1), 1 / sigma^2, Ipi_norm))
+
+## Student-t, Laplace, Half-Normal on mean -> importance weights
+prior_list <- list(
+  list(name = "Student-t(mu)", draw = function(n) scale_t * rt(n, df = df_t),
+       logprior = logprior_t),
+  list(name = "Laplace(mu)", draw = function(n) rlaplace(n, mu = mu_lap, b = b_lap),
+       logprior = logprior_lap),
+  list(name = "Half-Normal(theta)", draw = function(n) rhalfnorm(n, sd = sd_hn),
+       logprior = logprior_hn)
+)
+
+for (i in seq_along(prior_list)) {
+  prior_def <- prior_list[[i]]
+  set.seed(20260410 + i)
+  draws <- prior_def$draw(1500)
+  lw <- loglik_vals(draws) + vapply(draws, prior_def$logprior, numeric(1))
+  w <- weights_from_loglik(lw)
+  theta_ref <- sum(w * draws)
+  Ipi_ref <- Ipi_num(prior_def$logprior, theta_ref)
+  ess_local <- ess_trace(1 / sigma^2, Ipi_ref)
+  ess_prior <- global_trace_prior(matrix(draws, ncol = 1),
+                                  1 / sigma^2,
+                                  function(th) Ipi_num(prior_def$logprior, th))
+  ess_post <- global_trace(matrix(draws, ncol = 1),
+                           1 / sigma^2,
+                           function(th) Ipi_num(prior_def$logprior, th),
+                           weights = w)
+  add_row_post(prior_def$name, "$\\mathcal{N}(0.5, 10)$", "posterior_mean (IS)",
+               ess_local, ess_prior, ess_post)
+}
+
+## Lognormal prior on rate -> importance weights with Exponential likelihood
+theta_true <- 1.5
+set.seed(20260440)
+y_exp <- rexp(n_y, rate = theta_true)
+loglik_exp <- function(theta) sum(dexp(y_exp, rate = theta, log = TRUE))
+set.seed(20260441)
+draws <- rlnorm(1500, meanlog = meanlog, sdlog = sdlog)
+lw <- vapply(draws, loglik_exp, numeric(1)) +
+  vapply(draws, logprior_lnorm, numeric(1))
+w <- weights_from_loglik(lw)
+theta_ref <- sum(w * draws)
+Ipi_ref <- Ipi_num(logprior_lnorm, theta_ref)
+ess_local <- ess_trace(I1_exp(theta_ref), Ipi_ref)
+ess_prior <- global_trace_prior(matrix(draws, ncol = 1),
+                                I1_exp,
+                                function(th) Ipi_num(logprior_lnorm, th))
+ess_post <- global_trace(matrix(draws, ncol = 1),
+                         I1_exp,
+                         function(th) Ipi_num(logprior_lnorm, th),
+                         weights = w)
+add_row_post("Lognormal(theta)", "$\\mathrm{Exp}(1.5)$", "posterior_mean (IS)",
+             ess_local, ess_prior, ess_post)
+
+## Gamma prior on Poisson rate -> conjugate posterior
+lambda_true <- 2
+set.seed(20260420)
+y_pois <- rpois(n_y, lambda_true)
+a_g <- 6
+b_g <- 12
+a_post <- a_g + sum(y_pois)
+b_post <- b_g + length(y_pois)
+set.seed(20260421)
+post_draws <- rgamma(1000, shape = a_post, rate = b_post)
+theta_ref <- (a_post-1) / b_post
+Ipi_g <- Ipi_num(logprior_g, theta_ref)
+ess_local <- ess_trace(I1_pois(theta_ref), Ipi_g)
+set.seed(20260422)
+ess_prior <- global_trace_prior(matrix(rgamma(1000, shape = a_g, rate = b_g), ncol = 1),
+                                I1_pois,
+                                function(th) Ipi_num(logprior_g, th))
+ess_post <- global_trace(matrix(post_draws, ncol = 1),
+                         I1_pois,
+                         function(th) Ipi_num(logprior_g, th))
+add_row_post("Gamma(lambda)", "$\\mathrm{Poisson}(2)$", "posterior_mode",
+             ess_local, ess_prior, ess_post)
+
+## Inverse-Gamma prior on variance -> conjugate posterior
+sigma2_true <- 1.5^2
+set.seed(20260430)
+y_var <- rnorm(n_y, mean = 0, sd = sqrt(sigma2_true))
+a_ig <- 4
+b_ig <- 3
+a_post <- a_ig + length(y_var) / 2
+b_post <- b_ig + 0.5 * sum(y_var^2)
+set.seed(20260431)
+post_draws <- 1 / rgamma(1000, shape = a_post, rate = b_post)
+theta_ref_raw <- b_post / (a_post + 1)
+theta_bound <- 0.99 * (2 * b_ig / (a_ig + 1))
+theta_ref <- min(theta_ref_raw, theta_bound)
+Ipi_ig_safe <- function(th) {
+  val <- Ipi_num(logprior_ig, th)
+  if (is.matrix(val) && val[1, 1] < 0) val[1, 1] <- 0
+  val
+}
+Ipi_ig_ref <- Ipi_ig_safe(theta_ref)
+ess_local <- ess_trace(I1_var(theta_ref), Ipi_ig_ref)
+set.seed(20260432)
+ess_prior <- global_trace_prior(matrix(1 / rgamma(1000, shape = a_ig, rate = b_ig), ncol = 1),
+                                I1_var,
+                                Ipi_ig_safe)
+ess_post <- global_trace(matrix(post_draws, ncol = 1),
+                         I1_var,
+                         Ipi_ig_safe)
+add_row_post("Inv-Gamma(sigma2)", "$\\mathcal{N}(0, 2.25)$", "posterior_mode_clipped",
+             ess_local, ess_prior, ess_post)
+
+
+## Beta prior on Bernoulli p -> conjugate posterior
+p_true <- 0.3
+set.seed(20260449)
+y_bin <- rbinom(n_y, size = 1, prob = p_true)
+a_b <- 5
+b_b <- 5
+a_post <- a_b + sum(y_bin)
+b_post <- b_b + length(y_bin) - sum(y_bin)
+set.seed(20260451)
+post_draws <- rbeta(1000, a_post, b_post)
+theta_ref <- a_post / (a_post + b_post)
+Ipi_b_ref <- Ipi_beta(theta_ref, a_b, b_b)
+ess_local <- ess_trace(I1_bern(theta_ref), Ipi_b_ref)
+set.seed(20260450)
+ess_prior <- global_trace_prior(matrix(rbeta(1000, a_b, b_b), ncol = 1),
+                                I1_bern,
+                                function(th) Ipi_beta(th, a_b, b_b))
+ess_post <- global_trace(matrix(post_draws, ncol = 1),
+                         I1_bern,
+                         function(th) Ipi_beta(th, a_b, b_b))
+add_row_post("Beta(p)", "$\\mathrm{Bernoulli}(0.3)$", "posterior_mean",
+             ess_local, ess_prior, ess_post)
+
+invisible(results_post)
+```
+
+```{r posterior-display}
+posterior_labels <- results_post$prior
+posterior_labels[posterior_labels == "Beta(p)"] <- "Beta(p), a=b=5"
+
+common_priors_posterior_display <- data.frame(
+  Prior = posterior_labels,
+  `y (n=10)` = results_post$y,
+  `Reference Point` = results_post$theta_ref,
+  `Local ESS` = round(results_post$ESS_local, 1),
+  `Global ESS<br>Prior-average` = round(results_post$ESS_prior_avg, 1),
+  `Global ESS<br>Post-average` = round(results_post$ESS_post_avg, 1),
+  check.names = FALSE
+)
+
+knitr::kable(
+  common_priors_posterior_display,
+  escape = FALSE,
+  caption = "Posterior-updated ESS evaluations for common priors."
+)
+```
+
+The posterior-updated table shows how ESS shifts once inference is restricted to
+data-supported regions. When the posterior concentrates in regions where the
+prior is more sharply curved, as for the Student-$t$ and Laplace priors, both
+the local ESS at the posterior mean and the posterior-averaged global ESS rise
+relative to the prior-averaged global ESS. Conversely, when the posterior moves
+toward flatter regions of the prior, as in the Gamma and Inverse-Gamma
+examples, both the local ESS and the posterior-averaged global ESS drop
+substantially. This context dependence is exactly why multiple ESS summaries are
+useful: a single number is often not enough to characterize prior
+informativeness across both prior and posterior regimes.
+
+**Note:** For Laplace (non-differentiable at 0) and heavy-tailed priors, the
+Hessian-based $I_\pi$ is evaluated away from non-smooth points or via numerical
+approximations. For mixture priors, $I_\pi$ may be indefinite; consider PSD
+projection if needed.

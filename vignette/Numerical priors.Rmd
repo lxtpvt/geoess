@@ -1,0 +1,593 @@
+---
+title: "Numerical priors"
+output: html_vignette
+vignette: >
+  %\VignetteIndexEntry{Numerical priors}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", message = FALSE, warning = FALSE)
+set.seed(123)
+
+library(geoess)
+```
+
+## Theory recap
+
+Local ESS at a reference point $\theta^*$:
+
+$$
+ESS(\theta^*) = \frac{1}{d}\,\mathrm{tr}\{ I_1(\theta^*)^{-1} I_\pi(\theta^*) \}
+$$
+
+For mixture priors, geoess now also supports \emph{component-local} ESS
+reporting at component-specific reference points $\theta_k^*$:
+$$
+ESS_k(\theta_k^*) = \frac{1}{d}\,\mathrm{tr}\{ I_1(\theta_k^*)^{-1} I_{\pi_k}(\theta_k^*) \},
+$$
+with optional attribution scaling:
+$$
+ESS^{(w)}_k = w_k\,ESS_k.
+$$
+Here, $w_k$ is the mixture weight.
+If $\theta^*$ is a tied saddle point of components $k$ and $k+1$, the local ESS
+is defined as the average of the tied components' weighted ESS values:
+\begin{equation}
+  ESS(\theta^*)=[w_{k} \cdot ESS_{k}(\theta^*)+w_{k+1} \cdot ESS_{k+1}(\theta^*)]/2 \tag{1}.
+\end{equation}
+This convention bypasses the saddle's negative joint curvature, ensuring a
+non-negative and practically interpretable ESS at transition boundaries.
+
+Global ESS under $Q$:
+
+$$
+ESS_Q = \mathbb{E}_{\theta \sim Q}[ ESS(\theta) ].
+$$
+
+Here the prior is **unknown analytically** and only available via **samples**.
+We therefore:
+
+1. Draw $\theta$ from the prior and fit a parametric mixture $q(\theta)$.
+2. Use component curvature together with weighted hard assignment to compute
+   local ESS for mixture priors.
+3. Approximate global ESS by averaging those local ESS values under $Q$ using
+   the same draws.
+4. Use likelihood reweighting of prior draws to approximate posterior quantities.
+
+## Motivation
+
+To evaluate ESS under complex prior structures, we use a bimodal prior and
+compare three types of summaries:
+
+- reference-point-specific local ESS,
+- distribution-averaged global ESS, and
+- existing ESS estimates from `RBesT`.
+
+The goal is to show that for a complex prior, no single ESS summary is
+adequate on its own.
+
+## Simulation Design
+
+We simulate the prior as a two-component mixture on the real line:
+
+$$
+\pi(\theta) = 0.3\,\mathcal{N}(\mu_1, s_1^2) + 0.7\,\text{Beta}(a,b)\,\mathbf{1}_{(0,1)}(\theta).
+$$
+
+The Beta component contributes only on $(0,1)$, so the mixture has two local modes.
+We do **not** assume this mixture is known; we only observe samples from it.
+The parameters are chosen to make the two modes well-separated so local ESS
+changes with the reference point.
+
+```{r prior-simulation}
+# Mixture prior parameters
+w <- c(0.3, 0.7)
+# Separated components to make reference-point effects visible.
+mu1 <- 0.1
+s1 <- 0.08
+a <- 10
+b <- 2
+
+n_draws <- 1000
+set.seed(123)
+z <- rbinom(n_draws, size = 1, prob = w[1])
+prior_draws <- ifelse(
+  z == 1,
+  rnorm(n_draws, mean = mu1, sd = s1),
+  rbeta(n_draws, a, b)
+)
+
+summary(prior_draws)
+```
+
+## Helper utilities
+
+```{r helpers}
+logsumexp <- function(x) {
+  m <- max(x)
+  m + log(sum(exp(x - m)))
+}
+
+find_modes <- function(x, k = 2, bw = "nrd0") {
+  d <- density(x, bw = bw)
+  y <- d$y
+  idx <- which(y > c(-Inf, y[-length(y)]) & y > c(y[-1], -Inf))
+  if (length(idx) == 0L) return(rep(NA_real_, k))
+  ord <- idx[order(y[idx], decreasing = TRUE)]
+  modes <- d$x[ord][seq_len(min(k, length(ord)))]
+  if (length(modes) < k) modes <- c(modes, rep(NA_real_, k - length(modes)))
+  modes
+}
+
+find_saddle_between_modes <- function(x, bw = "nrd0") {
+  d <- density(x, bw = bw)
+  y <- d$y
+  idx_max <- which(y > c(-Inf, y[-length(y)]) & y > c(y[-1], -Inf))
+  if (length(idx_max) < 2L) return(NA_real_)
+
+  top2 <- idx_max[order(y[idx_max], decreasing = TRUE)[1:2]]
+  lo <- min(top2)
+  hi <- max(top2)
+  if ((hi - lo) < 2L) return(NA_real_)
+
+  idx_min <- which(y < c(Inf, y[-length(y)]) & y < c(y[-1], Inf))
+  idx_between <- idx_min[idx_min > lo & idx_min < hi]
+  j <- if (length(idx_between) > 0L) {
+    idx_between[which.min(y[idx_between])]
+  } else {
+    lo + which.min(y[lo:hi]) - 1L
+  }
+  d$x[j]
+}
+
+find_mix_resp_tie <- function(mix, comp = NULL, tol = 1e-10) {
+  if (is.null(mix$weights) || is.null(mix$mu) || is.null(mix$Sigma)) {
+    return(NA_real_)
+  }
+  w <- as.numeric(mix$weights)
+  w <- w / sum(w)
+  K <- length(w)
+  if (K < 2L) return(NA_real_)
+
+  if (is.null(comp)) {
+    comp <- order(w, decreasing = TRUE)[1:2]
+  }
+  a <- comp[1]
+  b <- comp[2]
+
+  mu_a <- as.numeric(mix$mu[[a]])[1]
+  mu_b <- as.numeric(mix$mu[[b]])[1]
+  sd_a <- sqrt(as.numeric(mix$Sigma[[a]][1, 1]))
+  sd_b <- sqrt(as.numeric(mix$Sigma[[b]][1, 1]))
+
+  f <- function(x) {
+    (log(w[a]) + dnorm(x, mean = mu_a, sd = sd_a, log = TRUE)) -
+      (log(w[b]) + dnorm(x, mean = mu_b, sd = sd_b, log = TRUE))
+  }
+
+  lo <- min(mu_a, mu_b)
+  hi <- max(mu_a, mu_b)
+  flo <- f(lo)
+  fhi <- f(hi)
+
+  if (abs(flo) <= tol) return(lo)
+  if (abs(fhi) <= tol) return(hi)
+
+  if (!is.finite(flo) || !is.finite(fhi) || flo * fhi > 0) {
+    lo <- min(mu_a - 6 * sd_a, mu_b - 6 * sd_b)
+    hi <- max(mu_a + 6 * sd_a, mu_b + 6 * sd_b)
+    flo <- f(lo)
+    fhi <- f(hi)
+    if (!is.finite(flo) || !is.finite(fhi) || flo * fhi > 0) {
+      return(NA_real_)
+    }
+  }
+
+  stats::uniroot(f, lower = lo, upper = hi, tol = tol)$root
+}
+
+weighted_mode <- function(x, w, bw = "nrd0") {
+  w <- w / sum(w)
+  d <- density(x, weights = w, bw = bw)
+  d$x[which.max(d$y)]
+}
+
+rbest_mixfit_best <- function(draws, type, Nc_grid = 1:2, aic_k = 2) {
+  if (!requireNamespace("RBesT", quietly = TRUE)) return(NULL)
+  if (!isTRUE(exists("mixfit", envir = asNamespace("RBesT"), mode = "function"))) {
+    return(NULL)
+  }
+  draws <- as.numeric(draws)
+  draws <- draws[is.finite(draws)]
+  if (length(draws) < 5L) return(NULL)
+  f <- get("mixfit", envir = asNamespace("RBesT"))
+  fits <- lapply(Nc_grid, function(nc) {
+    args <- list(sample = draws, type = type, Nc = nc, verbose = FALSE)
+    tryCatch(do.call(f, args), error = function(e) NULL)
+  })
+  aic <- vapply(
+    fits,
+    function(fit) if (is.null(fit)) Inf else AIC(fit, k = aic_k),
+    numeric(1)
+  )
+  if (!any(is.finite(aic))) return(NULL)
+  fits[[which.min(aic)]]
+}
+
+rbest_ess_from_draws <- function(draws, sigma, Nc_grid = 1:2) {
+  if (!requireNamespace("RBesT", quietly = TRUE)) {
+    return(c(elir = NA_real_, moment = NA_real_, morita = NA_real_))
+  }
+  mix <- rbest_mixfit_best(draws, type = "norm", Nc_grid = Nc_grid)
+  if (is.null(mix)) return(c(elir = NA_real_, moment = NA_real_, morita = NA_real_))
+  vapply(
+    c("elir", "moment", "morita"),
+    function(m) tryCatch(RBesT::ess(mix, method = m, sigma = sigma),
+                         error = function(e) NA_real_),
+    numeric(1)
+  )
+}
+```
+
+## Sample-based prior approximation
+
+We approximate the unknown prior by a **normal mixture** fit to the samples.
+This is a generic choice that can represent multi-modality even when the true
+prior is not normal. We **fix \(K=2\)** and select the fit by BIC within that
+two-component family so the approximation preserves the bimodality and the
+local ESS varies across reference points.
+
+```{r prior-fit}
+I1 <- matrix(1, nrow = 1, ncol = 1)  # placeholder, replaced below
+mix <- geoess_automixfit(matrix(prior_draws, ncol = 1), family = "norm",
+                         K_grid = 2, criterion = "BIC")
+mix$K_selected
+```
+
+## Likelihood model
+
+We use a Normal likelihood with known $\sigma$:
+
+$$
+Y_i \mid \theta \sim \mathcal{N}(\theta, \sigma^2), \quad I_1 = 1/\sigma^2.
+$$
+
+```{r likelihood}
+N <- 10
+sigma <- 1
+I1 <- matrix(1 / sigma^2, nrow = 1, ncol = 1)
+
+# Generate data from a value near the normal component mode
+theta_true <- 0.2
+set.seed(123)
+y <- rnorm(N, mean = theta_true, sd = sigma)
+y
+loglik_draw <- function(theta) {
+  sum(dnorm(y, mean = theta, sd = sigma, log = TRUE))
+}
+```
+
+## Local ESS: effect of reference point
+
+We compare local ESS at different reference points:
+
+- prior sample mean
+- two local prior modes
+- a misspecified point at the saddle between the two dominant modes
+- posterior mean (importance-weighted)
+- posterior mode (importance-weighted)
+
+```{r local-ess}
+# Prior reference points
+prior_mean <- mean(prior_draws)
+prior_modes <- find_modes(prior_draws, k = 2)
+prior_misspec <- find_mix_resp_tie(mix)
+if (!is.finite(prior_misspec)) {
+  prior_misspec <- find_saddle_between_modes(prior_draws)
+}
+if (!is.finite(prior_misspec)) {
+  prior_misspec <- mean(prior_modes, na.rm = TRUE)
+}
+
+# Approximate posterior weights via importance sampling
+logw <- vapply(prior_draws, loglik_draw, numeric(1))
+post_w <- exp(logw - logsumexp(logw))
+
+post_mean <- sum(post_w * prior_draws)
+post_mode <- weighted_mode(prior_draws, post_w)
+
+# Local ESS at reference points (using sample-based mixture for Ipi)
+ref_points <- c(prior_mean, prior_modes[1], prior_modes[2], prior_misspec,
+                post_mean, post_mode)
+ref_labels <- c("prior_mean", "prior_mode_1", "prior_mode_2",
+                "prior_misspecified", "posterior_mean", "posterior_mode")
+
+# Report strategy at every reference point:
+# - component-local unscaled ESS
+# - weighted hard-assignment ESS (paper definition)
+local_ess_row <- function(th) {
+  w_mix <- as.numeric(mix$weights)
+  w_mix <- w_mix / sum(w_mix)
+
+  # This vignette is 1D, so we can evaluate component responsibilities directly.
+  log_comp <- vapply(seq_along(w_mix), function(j) {
+    mu_j <- as.numeric(mix$mu[[j]])
+    sd_j <- sqrt(as.numeric(mix$Sigma[[j]]))
+    log(w_mix[j]) + dnorm(th, mean = mu_j, sd = sd_j, log = TRUE)
+  }, numeric(1))
+  resp <- exp(log_comp - logsumexp(log_comp))
+  k_star <- which.max(resp)
+
+  ess_components <- vapply(seq_along(w_mix), function(j) {
+    Ipi_j <- if (!is.null(mix$prec) && length(mix$prec) >= j && !is.null(mix$prec[[j]])) {
+      as.matrix(mix$prec[[j]])
+    } else {
+      solve(mix$Sigma[[j]])
+    }
+    as.numeric(geoess_trace(I1, Ipi_j))
+  }, numeric(1))
+
+  tol <- 1e-10
+  tie_idx <- which(abs(resp - max(resp)) <= tol)
+  ess_hard <- mean(w_mix[tie_idx] * ess_components[tie_idx])
+
+  weight_str <- if (length(tie_idx) == 1L) {
+    sprintf("%.3f", w_mix[k_star])
+  } else {
+    paste(sprintf("%.3f", w_mix[tie_idx]), collapse = " / ")
+  }
+
+  ess_comp_str <- if (length(tie_idx) == 1L) {
+    sprintf("%.1f", ess_components[k_star])
+  } else {
+    paste(sprintf("%.1f", ess_components[tie_idx]), collapse = " / ")
+  }
+
+  list(
+    Weights = weight_str,
+    ESS_component_unscaled = ess_comp_str,
+    ESS_local = as.numeric(ess_hard)
+  )
+}
+
+ess_rows <- lapply(ref_points, function(th) {
+  local_ess_row(th)
+})
+
+local_table <- data.frame(
+  Weights = vapply(ess_rows, `[[`, character(1), "Weights"),
+  ESS_component_unscaled = vapply(ess_rows, `[[`, character(1), "ESS_component_unscaled"),
+  ESS_local = round(vapply(ess_rows, `[[`, numeric(1), "ESS_local"), 1),
+  check.names = FALSE
+)
+rownames(local_table) <- ref_labels
+invisible(local_table)
+```
+
+## Plot: sample-based prior and reference points
+
+```{r prior-plot, fig.width=14, fig.height=5, fig.cap="Reference points used in the bimodal-prior example."}
+d_prior <- density(prior_draws)
+plot(d_prior, main = "Reference points in the bimodal-prior example",
+     xlab = expression(theta), ylab = "density")
+abline(v = prior_mean, col = "steelblue", lwd = 2)
+abline(v = prior_modes, col = "darkgreen", lwd = 2, lty = 2)
+abline(v = prior_misspec, col = "firebrick", lwd = 2, lty = 3)
+abline(v = post_mean, col = "purple", lwd = 2)
+abline(v = post_mode, col = "orange", lwd = 2, lty = 2)
+
+legend("topright",
+       legend = c("prior mean", "prior modes", "prior misspec",
+                  "posterior mean", "posterior mode"),
+       col = c("steelblue", "darkgreen", "firebrick", "purple", "orange"),
+       lwd = 2, lty = c(1, 2, 3, 1, 2), bty = "n")
+```
+
+## Global ESS (prior and posterior averages)
+
+Prior-averaged ESS uses the prior draws directly. Posterior-averaged ESS is
+approximated by reweighting those draws with the likelihood. For comparison, we
+also retain the older full-mixture global ESS calculation as an unweighted
+reference summary.
+
+```{r global-ess}
+has_global_attr <- "mixture_attribution" %in% names(formals(geoess_global))
+
+if (has_global_attr) {
+  ESS_global_prior <- geoess_global(
+    Q = matrix(prior_draws, ncol = 1),
+    I1 = I1,
+    Ipi = mix,
+    method = "trace",
+    mixture_attribution = "hard_resp",
+    psd = "clip"
+  )
+
+  ESS_global_post <- geoess_global(
+    Q = matrix(prior_draws, ncol = 1),
+    I1 = I1,
+    Ipi = mix,
+    method = "trace",
+    mixture_attribution = "hard_resp",
+    psd = "clip",
+    weights = post_w
+  )
+
+  ESS_global_prior_unweighted <- geoess_global(
+    Q = matrix(prior_draws, ncol = 1),
+    I1 = I1,
+    Ipi = mix,
+    method = "trace",
+    mixture_attribution = "mix",
+    psd = "clip"
+  )
+
+  ESS_global_post_unweighted <- geoess_global(
+    Q = matrix(prior_draws, ncol = 1),
+    I1 = I1,
+    Ipi = mix,
+    method = "trace",
+    mixture_attribution = "mix",
+    psd = "clip",
+    weights = post_w
+  )
+} else {
+  ess_local_all <- vapply(prior_draws, function(th) local_ess_row(th)$ESS_local, numeric(1))
+  post_w_norm <- post_w / sum(post_w)
+
+  ESS_global_prior <- list(estimate = mean(ess_local_all))
+  ESS_global_post <- list(estimate = sum(post_w_norm * ess_local_all))
+
+  ESS_global_prior_unweighted <- geoess_global(
+    Q = matrix(prior_draws, ncol = 1),
+    I1 = I1,
+    Ipi = mix,
+    method = "trace",
+    psd = "clip"
+  )
+
+  ESS_global_post_unweighted <- geoess_global(
+    Q = matrix(prior_draws, ncol = 1),
+    I1 = I1,
+    Ipi = mix,
+    method = "trace",
+    psd = "clip",
+    weights = post_w
+  )
+}
+
+global_table <- data.frame(
+  prior_avg = ESS_global_prior$estimate,
+  posterior_avg = ESS_global_post$estimate,
+  unweighted_prior_avg = ESS_global_prior_unweighted$estimate,
+  unweighted_posterior_avg = ESS_global_post_unweighted$estimate
+)
+invisible(global_table)
+```
+
+## RBesT comparison (prior-only)
+
+We fit a normal mixture to the same draws using RBesT and compute
+ELIR / moment / Morita ESS as a baseline comparison.
+
+```{r rbest-compare}
+rbest_vals <- if (requireNamespace("RBesT", quietly = TRUE)) {
+  rbest_ess_from_draws(prior_draws, sigma = sigma)
+} else {
+  c(elir = NA_real_, moment = NA_real_, morita = NA_real_)
+}
+invisible(rbest_vals)
+```
+
+## ESS Comparison Summary
+
+```{r ess-comparison-display}
+format_slash_round <- function(x, digits = 1) {
+  parts <- trimws(strsplit(as.character(x), "/", fixed = TRUE)[[1]])
+  vals <- suppressWarnings(as.numeric(parts))
+  if (all(is.finite(vals))) {
+    paste(format(round(vals, digits), nsmall = digits, trim = TRUE), collapse = " / ")
+  } else {
+    x
+  }
+}
+
+local_panel <- data.frame(
+  `Reference Point` = c(
+    "Prior Mean",
+    sprintf("Prior Mode near %.2f", ref_points[2]),
+    sprintf("Prior Mode near %.2f", ref_points[3]),
+    "Saddle point",
+    "Posterior Mean",
+    "Posterior Mode"
+  ),
+  `Reference \\(\\theta^*\\)` = round(ref_points, 3),
+  Weights = vapply(local_table$Weights, format_slash_round, character(1), digits = 1),
+  `Unweighted value` = vapply(local_table$ESS_component_unscaled, format_slash_round, character(1), digits = 1),
+  Value = round(local_table$ESS_local, 1),
+  check.names = FALSE
+)
+
+global_panel <- data.frame(
+  `Q-averaged` = c("Prior-averaged", "Posterior-averaged"),
+  Value = round(c(global_table$prior_avg, global_table$posterior_avg), 1),
+  `Unweighted value` = round(c(global_table$unweighted_prior_avg, global_table$unweighted_posterior_avg), 1),
+  check.names = FALSE
+)
+
+existing_panel <- data.frame(
+  Method = c("Morita", "Moment", "ELIR"),
+  Value = round(c(rbest_vals["morita"], rbest_vals["moment"], rbest_vals["elir"]), 1),
+  check.names = FALSE
+)
+
+knitr::kable(
+  local_panel,
+  escape = FALSE,
+  caption = paste(
+    "Panel A: local ESS for the bimodal prior example.",
+    "The weights and unweighted values refer to the local component;",
+    "at the saddle point, both tied components are shown."
+  )
+)
+
+knitr::kable(
+  global_panel,
+  escape = FALSE,
+  caption = "Panel B: global ESS for the bimodal prior example."
+)
+
+knitr::kable(
+  existing_panel,
+  escape = FALSE,
+  caption = "Panel C: existing ESS estimated from RBesT for the bimodal prior example."
+)
+```
+
+Panel A shows that local ESS varies substantially across reference points. The
+values range from 47.9 to 63.0 depending on the location of the reference
+point. The prior mean and the mode near 0.87 both yield ESS 63.0, reflecting
+the same dominant Gaussian component. By contrast, the mode near 0.10, the
+posterior mean, and the posterior mode all yield ESS 47.9, because those
+reference points are attributed to the other local component. At the saddle
+point, the weighted tie rule in Equation (1) gives an
+intermediate value of 55.5. This is exactly the kind of reference-point
+dependence that a single ESS number would miss.
+
+Panel B reports the global ESS summaries. The prior-averaged and
+posterior-averaged values are 58.6 and 54.0, respectively, when the weighted
+hard-assignment local ESS is used. For comparison, the older unweighted
+full-mixture summaries are much larger at 110.4 and 131.9. This contrast shows
+that the choice of local attribution rule carries through directly into the
+global summary.
+
+Panel C compares the same prior with existing sample-based ESS methods from
+`RBesT`. Morita ESS is 88.6, close to the unweighted local value 89.5 from the
+dominant Gaussian component. The moment method gives only 8.2, whereas ELIR is
+110.7, close to the unweighted prior-averaged global ESS 110.4. These large
+discrepancies illustrate that existing methods can behave quite differently for
+multimodal priors, especially when they implicitly collapse the geometry to a
+single-number summary.
+
+In this vignette:
+
+- `ESS_component_unscaled` is the unscaled ESS of the max-responsibility component.
+- `ESS_local` is the paper definition based on weighted hard assignment:
+  \(w_{k^*}\,ESS_{k^*}(\theta^*)\) for a unique winner, and
+  \(\frac{1}{|T|}\sum_{k\in T} w_k\,ESS_k(\theta^*)\) when responsibilities tie.
+  In particular, at a tied saddle point between two components, we use
+  (1), that is, the average of the tied components' weighted ESS
+  values.
+
+Global ESS averages local ESS values under an explicitly chosen weighting
+distribution. For mixture priors, the default global summary in
+`geoess_global()` uses the same weighted hard-assignment rule as the local ESS
+definition.
+
+Taken together, the local and global summaries show why multiple ESS should be
+reported for complex priors. Local ESS describes how informative the prior is
+at a specific reference point, whereas global ESS describes average
+informativeness under a stated weighting distribution. For bimodal or otherwise
+complex priors, both are needed to characterize prior influence adequately.
