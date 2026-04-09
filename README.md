@@ -25,7 +25,7 @@ if (!requireNamespace("remotes", quietly = TRUE)) {
   install.packages("remotes")
 }
 
-remotes::install_github("YOUR_USERNAME/geoess")
+remotes::install_github("lxtpvt/geoess")
 ```
 
 If you are working from a local checkout, you can also install with:
