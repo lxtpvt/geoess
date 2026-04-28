@@ -369,20 +369,55 @@ invisible(local_table)
 ## Plot: sample-based prior and reference points
 
 ```{r prior-plot, fig.width=14, fig.height=5, fig.cap="Reference points used in the bimodal-prior example."}
+old_par <- par(no.readonly = TRUE)
+on.exit(par(old_par))
+par(mar = c(10, 4.5, 4, 2) + 0.1, xpd = NA)
+
 d_prior <- density(prior_draws)
+d_post <- density(prior_draws, weights = post_w / sum(post_w), bw = d_prior$bw)
+x_range <- range(c(d_prior$x, y, ref_points), finite = TRUE)
+x_pad <- 0.04 * diff(x_range)
+if (!is.finite(x_pad) || x_pad <= 0) x_pad <- 0.1
+xlim_all <- c(x_range[1] - x_pad, x_range[2] + x_pad)
+axis_ticks <- pretty(xlim_all)
+y_top <- 1.05 * max(d_prior$y)
+
 plot(d_prior, main = "Reference points in the bimodal-prior example",
-     xlab = expression(theta), ylab = "density")
-abline(v = prior_mean, col = "steelblue", lwd = 2)
-abline(v = prior_modes, col = "darkgreen", lwd = 2, lty = 2)
-abline(v = prior_misspec, col = "firebrick", lwd = 2, lty = 3)
-abline(v = post_mean, col = "purple", lwd = 2)
-abline(v = post_mode, col = "orange", lwd = 2, lty = 2)
+     xlab = "", ylab = "density",
+     ylim = c(0, y_top),
+     xlim = xlim_all, xaxt = "n",
+     lwd = 3, col = "black")
+lines(d_post, col = "deeppink3", lwd = 2)
+
+draw_vlines <- function(x, col, lwd = 2, lty = 1) {
+  segments(x0 = x, y0 = 0, x1 = x, y1 = y_top, col = col, lwd = lwd, lty = lty, xpd = FALSE)
+}
+
+draw_vlines(prior_mean, col = "steelblue", lwd = 2)
+draw_vlines(prior_modes, col = "darkgreen", lwd = 2, lty = 2)
+draw_vlines(prior_misspec, col = "firebrick", lwd = 2, lty = 3)
+draw_vlines(post_mean, col = "purple", lwd = 2)
+draw_vlines(post_mode, col = "orange", lwd = 2, lty = 2)
+
+axis(1, at = axis_ticks)
+mtext(expression(theta), side = 1, line = 2.5)
+usr <- par("usr")
+bottom_in <- grconvertY(usr[3], from = "user", to = "inches")
+y_obs_axis <- grconvertY(bottom_in - 2 / 2.54, from = "inches", to = "user")
+tick_len <- 0.02 * diff(usr[3:4])
+text_off <- 0.045 * diff(usr[3:4])
+
+segments(xlim_all[1], y_obs_axis, xlim_all[2], y_obs_axis, col = "gray30")
+segments(axis_ticks, y_obs_axis, axis_ticks, y_obs_axis + tick_len, col = "gray30")
+text(axis_ticks, y_obs_axis - text_off, labels = axis_ticks, col = "gray30")
+text(mean(xlim_all), y_obs_axis - 2.2 * text_off, labels = "observation y", col = "gray30")
+points(y, rep(y_obs_axis, length(y)), pch = 16, col = "gray30")
 
 legend("topright",
-       legend = c("prior mean", "prior modes", "prior misspec",
+       legend = c("bimodal prior", "posterior", "prior mean", "prior modes", "prior misspec",
                   "posterior mean", "posterior mode"),
-       col = c("steelblue", "darkgreen", "firebrick", "purple", "orange"),
-       lwd = 2, lty = c(1, 2, 3, 1, 2), bty = "n")
+       col = c("black", "deeppink3", "steelblue", "darkgreen", "firebrick", "purple", "orange"),
+       lwd = c(3, 2, 2, 2, 2, 2, 2), lty = c(1, 1, 1, 2, 3, 1, 2), bty = "n")
 ```
 
 ## Global ESS (prior and posterior averages)
